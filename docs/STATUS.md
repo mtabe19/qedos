@@ -1,8 +1,8 @@
-# qedos STATUS — verified vs. not (2026-10-18)
+# QEDOS STATUS — verified vs. not (2026-10-18)
 
 **What exists and is verified:**
 1. **seL4 + Microkit Multi-PD Appliance (`build/sel4/loader.img`, Stages B–D):**
-   * Boots on seL4 + Microkit 2.3.1 (`x86_64_generic`) in QEMU with 12 Protection Domains: 7 sDDF hardware/virtualiser PDs (`timer_driver`, `serial_driver`, `serial_virt_tx`, `ethernet_driver`, `net_virt_rx`, `net_virt_tx`, `tcp_net_copier`) and 5 isolated qedos application PDs (`tcp_pd`, `tls_pd`, `http_pd`, `policy_pd`, `connector_pd`).
+   * Boots on seL4 + Microkit 2.3.1 (`x86_64_generic`) in QEMU with 12 Protection Domains: 7 sDDF hardware/virtualiser PDs (`timer_driver`, `serial_driver`, `serial_virt_tx`, `ethernet_driver`, `net_virt_rx`, `net_virt_tx`, `tcp_net_copier`) and 5 isolated QEDOS application PDs (`tcp_pd`, `tls_pd`, `http_pd`, `policy_pd`, `connector_pd`).
    * `tls_pd` runs freestanding OpenSSL 3.6.1 over memory BIOs enforcing TLS 1.3 + `X25519MLKEM768` + `TLS_AES_256_GCM_SHA384` only, and is the **sole holder of the TLS private key (`LAW_008`)**.
    * `http_pd`, `policy_pd`, and `connector_pd` link the `#![no_std]`, `#![forbid(unsafe_code)]` Rust crates `pg-http`, `pg-policy`, and `pg-config` compiled for `x86_64-unknown-none`.
    * `policy_pd` verifies the Ed25519 signature of `shm_signed_config` (`config/sel4/proxy.sconf`) against the pinned public key at boot before activating any route or backend (`LAW_011`).

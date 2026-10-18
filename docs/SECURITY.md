@@ -1,4 +1,4 @@
-# qedos security specification (current, honest)
+# QEDOS security specification (current, honest)
 
 ## Scope of the guarantees
 * **TLS (`LAW_002`, `LAW_003`)**: TLS 1.3 only; key exchange group `X25519MLKEM768` only; cipher

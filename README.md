@@ -30,12 +30,12 @@ cargo kani -p pg-policy && cargo kani -p pg-http && cargo kani -p pg-config   # 
 ```
 
 ## Running on macOS (Apple Silicon / Intel)
-Prebuilt seL4 multi-PD images (`build/sel4/loader.img.gz` + `build/sel4/sel4_32.elf.gz`) are included in the repository so you can boot and test **qedos** on seL4 directly on a Mac without rebuilding the cross-toolchains:
+Prebuilt seL4 multi-PD images (`build/sel4/loader.img.gz` + `build/sel4/sel4_32.elf.gz`) are included in the repository so you can boot and test **QEDOS** on seL4 directly on a Mac without rebuilding the cross-toolchains:
 ```sh
 brew install qemu openssl@3 rust
 git clone https://github.com/shi3z/qedos.git && cd qedos
 
-# 1. Boot the 12-PD seL4 qedos appliance in QEMU and run all 6 end-to-end PQC HTTPS tests:
+# 1. Boot the 12-PD seL4 QEDOS appliance in QEMU and run all 6 end-to-end PQC HTTPS tests:
 python3 tests/test_sel4.py
 
 # 2. Run Rust unit tests & Viper capability audit natively on macOS:

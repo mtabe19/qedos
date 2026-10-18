@@ -1,4 +1,4 @@
-# qedos — architecture and implementation
+# QEDOS — architecture and implementation
 
 Status legend: **[verified]** = built, tested, and reproduced in this repo; **[open]** = requires physical bare-metal hardware.
 
