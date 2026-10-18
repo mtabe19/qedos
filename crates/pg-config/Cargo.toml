@@ -3,7 +3,7 @@ name = "pg-config"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "ProofGate signed configuration format and Ed25519 verification (LAW_011)"
+description = "qedos signed configuration format and Ed25519 verification (LAW_011)"
 
 [dependencies]
 pg-http = { path = "../pg-http" }

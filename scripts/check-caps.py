@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ProofGate OS — Formal Capability & Isolation Audit (`LAW_008`, `LAW_011`, `LAW_012`).
+qedos — Formal Capability & Isolation Audit (`LAW_008`, `LAW_011`, `LAW_012`).
 
 Verifies both the Microkit system description (`build/sel4/proofgate.system`),
 the Microkit-generated Viper formal invariant models (`build/sel4/viper/*.vpr`),

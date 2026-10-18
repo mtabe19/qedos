@@ -1,4 +1,4 @@
-//! ProofGate strict HTTP/1.1 parsing.
+//! qedos strict HTTP/1.1 parsing.
 //!
 //! * `#![no_std]`, no allocation, `#![forbid(unsafe_code)]`.
 //! * All results are offsets into the caller's buffer; nothing is copied.

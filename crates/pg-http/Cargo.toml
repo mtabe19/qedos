@@ -3,7 +3,7 @@ name = "pg-http"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "ProofGate strict HTTP/1.1 head parser and chunked decoder (no_std, no alloc, no unsafe)"
+description = "qedos strict HTTP/1.1 head parser and chunked decoder (no_std, no alloc, no unsafe)"
 
 [dependencies]
 

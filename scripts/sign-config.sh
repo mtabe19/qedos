@@ -1,5 +1,5 @@
 #!/bin/sh
-# Sign ProofGate configuration files with Ed25519 (LAW_011).
+# Sign qedos configuration files with Ed25519 (LAW_011).
 #
 # Usage:
 #   scripts/sign-config.sh [--key KEY.pem] [FILE.conf ...]

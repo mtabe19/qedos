@@ -1,5 +1,5 @@
 /*
- * ProofGate OS — TLS 1.3 + X25519MLKEM768 Protection Domain (`tls_pd.elf`).
+ * qedos — TLS 1.3 + X25519MLKEM768 Protection Domain (`tls_pd.elf`).
  *
  * Isolation & Security Laws:
  *   - ONLY holder of the TLS server private key (LAW_008). The `tls_keystore` memory

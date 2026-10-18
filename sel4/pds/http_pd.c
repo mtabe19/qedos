@@ -1,5 +1,5 @@
 /*
- * ProofGate OS — HTTP Parser Protection Domain (`http_pd.elf`).
+ * qedos — HTTP Parser Protection Domain (`http_pd.elf`).
  *
  * Isolation & Security Laws:
  *   - Links `#![no_std]`, `#![forbid(unsafe_code)]` Rust crate `pg-http` via `libpg_sel4_pds.a` (LAW_006).

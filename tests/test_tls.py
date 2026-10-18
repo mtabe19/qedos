@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TEST_TLS_001 .. TEST_TLS_010 for the ProofGate host reference proxy.
+"""TEST_TLS_001 .. TEST_TLS_010 for the qedos host reference proxy.
 
 Clients: the pinned OpenSSL 3.6.1 `s_client` (group control), Python `ssl`
 (also OpenSSL 3.6.1), and real Chrome. Success is judged on the *negotiated*

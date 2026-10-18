@@ -3,7 +3,7 @@ name = "pg-policy"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "ProofGate fixed-route policy engine (no_std, no alloc, no unsafe)"
+description = "qedos fixed-route policy engine (no_std, no alloc, no unsafe)"
 
 [dependencies]
 pg-http = { path = "../pg-http" }

@@ -1,5 +1,5 @@
 /*
- * ProofGate OS — Fixed-Backend Connector Protection Domain (`connector_pd.elf`).
+ * qedos — Fixed-Backend Connector Protection Domain (`connector_pd.elf`).
  *
  * Isolation & Security Laws:
  *   - Only receives requests that `policy_pd` has explicitly approved with `Decision::Forward` (LAW_007).

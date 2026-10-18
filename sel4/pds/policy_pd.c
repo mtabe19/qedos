@@ -1,5 +1,5 @@
 /*
- * ProofGate OS — Policy Engine Protection Domain (`policy_pd.elf`).
+ * qedos — Policy Engine Protection Domain (`policy_pd.elf`).
  *
  * Isolation & Security Laws:
  *   - Links `#![no_std]`, `#![forbid(unsafe_code)]` Rust crates `pg-policy` and `pg-config`

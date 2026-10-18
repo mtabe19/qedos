@@ -1,6 +1,6 @@
-# ProofGate OS
+# qedos
 
-A PQC-hybrid-only HTTPS reverse-proxy appliance running on **seL4 + Microkit 2.3.1 (`x86_64_generic`)** with a matching Linux reference proxy.
+**qedos** is a formally verified, PQC-hybrid-only HTTPS reverse-proxy OS appliance running on **seL4 + Microkit 2.3.1 (`x86_64_generic`)** with a matching Linux reference proxy.
 Enforces **TLS 1.3 + `X25519MLKEM768` + `TLS_AES_256_GCM_SHA384` only**, strict `#![no_std]` / `#![forbid(unsafe_code)]` HTTP/1.1 parsing (`pg-http`), fixed-route policy (`pg-policy`), Ed25519 signed configuration (`pg-config`, `LAW_011`), 5 isolated seL4 Protection Domains (`tcp_pd`, `tls_pd`, `http_pd`, `policy_pd`, `connector_pd`), Kani bounded proofs (`13/13` harnesses passing), and Microkit Viper capability verification (`LAW_008`, `LAW_012`).
 
 **Read `docs/STATUS.md` first** — it separates what is verified from what remains hardware-dependent.

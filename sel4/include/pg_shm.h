@@ -1,5 +1,5 @@
 /*
- * ProofGate OS — Shared-Memory Ring & Mailbox Definitions across seL4 PDs.
+ * qedos — Shared-Memory Ring & Mailbox Definitions across seL4 PDs.
  *
  * Capability Isolation Invariants (LAW_008, LAW_012):
  *   - VADDR_SHM_TCP_TLS     (0x30000000): mapped ONLY in tcp_pd and tls_pd

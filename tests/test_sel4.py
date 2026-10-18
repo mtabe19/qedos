@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-End-to-end integration test suite for ProofGate OS running on seL4 + Microkit in QEMU (`build/sel4/loader.img`).
+End-to-end integration test suite for qedos running on seL4 + Microkit in QEMU (`build/sel4/loader.img`).
 
 Tests across the 5 isolated seL4 Protection Domains (`tcp_pd`, `tls_pd`, `http_pd`, `policy_pd`, `connector_pd`):
   - SEL4_001: Boot all 12 PDs, verify Ed25519 signed config in `policy_pd` (LAW_011),

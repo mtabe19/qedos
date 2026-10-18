@@ -1,4 +1,4 @@
-//! `#![no_std]` Rust implementation for ProofGate seL4 Protection Domains:
+//! `#![no_std]` Rust implementation for qedos seL4 Protection Domains:
 //!   - `http_pd`: strict HTTP/1.1 request head + body parsing via `pg_http` (LAW_006, LAW_007)
 //!   - `policy_pd`: Ed25519 signed config verification via `pg_config` (LAW_011) and
 //!     fixed-route + path-hygiene evaluation via `pg_policy` (LAW_001, LAW_004, LAW_007)

@@ -1,5 +1,5 @@
 /*
- * ProofGate OS — TCP/IP Stack Protection Domain (`tcp_pd.elf`).
+ * qedos — TCP/IP Stack Protection Domain (`tcp_pd.elf`).
  *
  * Isolation & Security Laws:
  *   - Runs sDDF network queues + lwIP TCP/IP stack.

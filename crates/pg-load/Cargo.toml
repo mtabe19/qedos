@@ -3,7 +3,7 @@ name = "pg-load"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "ProofGate load generator (PQC TLS clients) and fast epoll test backend"
+description = "qedos load generator (PQC TLS clients) and fast epoll test backend"
 
 [dependencies]
 mio = { version = "1", features = ["os-poll", "net"] }

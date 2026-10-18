@@ -3,7 +3,7 @@ name = "pg-proxy"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "ProofGate host reference proxy: PQC-hybrid-only TLS 1.3 HTTPS reverse proxy"
+description = "qedos host reference proxy: PQC-hybrid-only TLS 1.3 HTTPS reverse proxy"
 
 [dependencies]
 pg-http = { path = "../pg-http" }

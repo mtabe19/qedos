@@ -1,4 +1,4 @@
-//! ProofGate policy engine: fixed routes, no dynamic destinations.
+//! qedos policy engine: fixed routes, no dynamic destinations.
 //!
 //! The only output that can lead to an outbound connection is
 //! `Decision::Forward { backend, .. }` where `backend` is an *index* into a

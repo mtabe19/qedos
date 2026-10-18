@@ -1,4 +1,4 @@
-//! ProofGate signed configuration format and Ed25519 verification (LAW_011).
+//! qedos signed configuration format and Ed25519 verification (LAW_011).
 //!
 //! * `#![no_std]`, zero allocation, `#![forbid(unsafe_code)]`.
 //! * Provides both a compact deterministic binary signed configuration format

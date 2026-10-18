@@ -1,4 +1,4 @@
-"""Shared fixtures for the ProofGate host tests (no third-party packages)."""
+"""Shared fixtures for the qedos host tests (no third-party packages)."""
 import atexit, json, os, re, socket, ssl, subprocess, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

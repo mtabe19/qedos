@@ -1,4 +1,4 @@
-//! ProofGate host reference proxy (intermediate stage, runs on Linux).
+//! qedos host reference proxy (intermediate stage, runs on Linux).
 //!
 //! Usage: pg-proxy --config FILE [--no-access-log] [--no-tls-log] [--stats]
 

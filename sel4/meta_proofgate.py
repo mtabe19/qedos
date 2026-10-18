@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate the ProofGate OS Microkit system description (`proofgate.system`)
+Generate the qedos Microkit system description (`proofgate.system`)
 and sDDF driver/client configuration blobs.
 """
 import argparse
@@ -62,7 +62,7 @@ def main() -> None:
     net_virt_rx = ProtectionDomain("net_virt_rx", "network_virt_rx.elf", priority=99, cpu=0)
     net_system = Sddf.Net(sdf, None, ethernet_driver, net_virt_tx, net_virt_rx)
 
-    # 2. ProofGate Application PDs (256 KiB stack per PD for ML-KEM-768 & parser state)
+    # 2. qedos Application PDs (256 KiB stack per PD for ML-KEM-768 & parser state)
     tcp_pd = ProtectionDomain(
         "tcp_pd", "tcp_pd.elf", priority=97, budget=20000, stack_size=0x40000, cpu=0
     )
@@ -96,7 +96,7 @@ def main() -> None:
     assert tcp_lwip.connect()
     assert tcp_lwip.serialise_config(args.output)
 
-    # 3. ProofGate Isolated Shared Memory Regions (LAW_008, LAW_011, LAW_012)
+    # 3. qedos Isolated Shared Memory Regions (LAW_008, LAW_011, LAW_012)
     shm_tcp_tls = MemoryRegion(sdf, "shm_tcp_tls", 0x40000)
     shm_tls_http = MemoryRegion(sdf, "shm_tls_http", 0x40000)
     shm_http_policy = MemoryRegion(sdf, "shm_http_policy", 0x10000)
@@ -149,7 +149,7 @@ def main() -> None:
     connector_pd.add_map(Map(shm_tcp_conn, 0x3600_0000, "rw"))
     tcp_pd.add_map(Map(shm_tcp_conn, 0x3600_0000, "rw"))
 
-    # 4. ProofGate IPC Channels
+    # 4. qedos IPC Channels
     sdf.add_channel(Channel(tcp_pd, tls_pd, a_id=10, b_id=1))
     sdf.add_channel(Channel(tls_pd, http_pd, a_id=2, b_id=1))
     sdf.add_channel(Channel(http_pd, policy_pd, a_id=2, b_id=1))

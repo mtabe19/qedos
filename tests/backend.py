@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test backends A (port 19001) and B (19002) for the ProofGate host tests.
+"""Test backends A (port 19001) and B (19002) for the qedos host tests.
 
 Every response echoes what the backend actually received so tests can assert
 what the proxy forwarded (headers, body length, raw request line).

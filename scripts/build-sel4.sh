@@ -1,6 +1,6 @@
 #!/bin/sh
 # Build the complete seL4 + Microkit + sDDF + Freestanding OpenSSL 3.6.1 + Rust no_std
-# ProofGate OS multi-PD image (`build/sel4/loader.img`) and Viper capability models (`build/sel4/viper/`).
+# qedos multi-PD image (`build/sel4/loader.img`) and Viper capability models (`build/sel4/viper/`).
 set -eu
 
 R=$(cd "$(dirname "$0")/.." && pwd)

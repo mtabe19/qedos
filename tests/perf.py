@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PERF_001 .. PERF_008 for the ProofGate host reference proxy.
+"""PERF_001 .. PERF_008 for the qedos host reference proxy.
 
 Starts the perf stack (proxy + two fast epoll backends), drives it with
 pg-load (PQC-only TLS 1.3 clients), and cross-checks the *server's* own view
