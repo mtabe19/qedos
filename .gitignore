@@ -17,6 +17,8 @@
 !/build/sel4/proofgate.system
 !/build/sel4/report.txt
 !/build/sel4/viper/
+!/build/sel4/loader.img.gz
+!/build/sel4/sel4_32.elf.gz
 
 # Compiled objects and test runners in sel4/libc_shim
 /sel4/libc_shim/*.o

@@ -2,7 +2,12 @@
 import atexit, json, os, re, socket, ssl, subprocess, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OPENSSL = os.path.join(ROOT, "third_party/openssl-install/bin/openssl")
+_OPENSSL_CANDIDATES = [
+    os.path.join(ROOT, "third_party/openssl-install/bin/openssl"),
+    "/opt/homebrew/opt/openssl@3/bin/openssl",
+    "/usr/local/opt/openssl@3/bin/openssl",
+]
+OPENSSL = next((p for p in _OPENSSL_CANDIDATES if os.path.isfile(p)), "openssl")
 PROXY_LOG = os.path.join(ROOT, "build/run/proxy.log")
 HOST, PORT = "127.0.0.1", 8443
 REQUIRED_GROUP = "X25519MLKEM768"

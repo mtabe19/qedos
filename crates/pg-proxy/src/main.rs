@@ -88,8 +88,11 @@ fn main() {
         // load has dropped so RSS tracks live connections (PERF_007).
         peak = peak.max(m.active);
         if m.active * 2 < peak {
-            // SAFETY: malloc_trim has no preconditions.
-            unsafe { libc::malloc_trim(0) };
+            // SAFETY: malloc_trim has no preconditions (glibc-only).
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            unsafe {
+                libc::malloc_trim(0);
+            }
             peak = m.active;
         }
         if stats {

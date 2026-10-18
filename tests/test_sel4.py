@@ -21,7 +21,12 @@ import sys
 import time
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-OPENSSL = os.path.join(ROOT, "third_party/openssl-install/bin/openssl")
+_OPENSSL_CANDIDATES = [
+    os.path.join(ROOT, "third_party/openssl-install/bin/openssl"),
+    "/opt/homebrew/opt/openssl@3/bin/openssl",
+    "/usr/local/opt/openssl@3/bin/openssl",
+]
+OPENSSL = next((p for p in _OPENSSL_CANDIDATES if os.path.isfile(p)), "openssl")
 OPENSSL_CONF = os.path.join(ROOT, "config/openssl-min.cnf")
 LOADER_IMG = os.path.join(ROOT, "build/sel4/loader.img")
 SERIAL_LOG = os.path.join(ROOT, "build/sel4/serial.log")
