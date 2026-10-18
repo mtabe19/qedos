@@ -20,6 +20,9 @@ size_t libc_shim_heap_capacity(void);
 /* Monotonic wall-clock epoch setter (defaults to 2026-10-18T00:00:00Z so X.509 checks succeed) */
 void libc_shim_set_epoch(int64_t epoch_sec);
 
+/* Feed the monotonic clock (ns). Required on aarch64 (no EL0 counter access); no-op on x86_64. */
+void libc_shim_set_clock_ns(uint64_t ns);
+
 /* Standard allocator API */
 void *malloc(size_t size);
 void free(void *ptr);

@@ -421,6 +421,9 @@ static void netif_status_callback(char *ip_addr)
 
 static void set_timeout(void)
 {
+    /* Publish monotonic ns for tls_pd (its only time source on aarch64). */
+    shm_tcp_tls->now_ns = sddf_timer_time_now(timer_config.driver_id);
+    PG_FENCE();
     sddf_timer_set_timeout(timer_config.driver_id, LWIP_TICK_MS * NS_IN_MS);
 }
 

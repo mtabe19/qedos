@@ -7,7 +7,7 @@ import argparse
 import os
 import sys
 
-from sdfgen import SystemDescription, Sddf
+from sdfgen import SystemDescription, Sddf, DeviceTree
 
 ProtectionDomain = SystemDescription.ProtectionDomain
 MemoryRegion = SystemDescription.MemoryRegion
@@ -20,47 +20,78 @@ def main() -> None:
     parser.add_argument("--sddf", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--sdf", required=True)
+    parser.add_argument("--board", default="x86_64_generic",
+                        help="Microkit board: x86_64_generic (default), qemu_virt_aarch64, rpi4b_1gb")
+    parser.add_argument("--dtb", default=None, help="board DTB (required for aarch64 boards)")
     args = parser.parse_args()
 
     sys.path.append(os.path.join(args.sddf, "tools/meta"))
     from board import BOARDS, add_x86_hpet
 
-    board = next(b for b in BOARDS if b.name == "x86_64_generic")
-    sdf = SystemDescription(board.arch, board.paddr_top)
+    board = next(b for b in BOARDS if b.name == args.board)
+    is_x86 = board.arch == SystemDescription.Arch.X86_64
+    paddr_top = board.paddr_top
+    if board.name.startswith("rpi4b"):
+        # sDDF's rpi4b_1gb default (32 MiB) assumes a tiny image; the QEDOS image (OpenSSL + 16 MiB heaps)
+        # occupies that low RAM, so place DMA/ring regions below 768 MiB instead (valid RAM ends ~0x3b400000).
+        paddr_top = 0x3000_0000
+    sdf = SystemDescription(board.arch, paddr_top)
     Sddf(args.sddf)
+
+    uart_node = ethernet_node = timer_node = None
+    if not is_x86:
+        if args.dtb is None:
+            sys.exit(f"--dtb is required for board {board.name}")
+        with open(args.dtb, "rb") as f:
+            dtb = DeviceTree(f.read())
+        uart_node = dtb.node(board.serial)
+        ethernet_node = dtb.node(board.ethernet)
+        timer_node = dtb.node(board.timer)
+        assert uart_node and ethernet_node and timer_node, "DTB is missing a board device node"
 
     # 1. Hardware & Virtualiser PDs (sDDF)
     timer_driver = ProtectionDomain("timer_driver", "timer_driver.elf", priority=102, cpu=0)
-    timer_system = Sddf.Timer(sdf, None, timer_driver)
-    add_x86_hpet(sdf, timer_driver)
+    timer_system = Sddf.Timer(sdf, timer_node, timer_driver)
+    if is_x86:
+        add_x86_hpet(sdf, timer_driver)
 
     serial_driver = ProtectionDomain("serial_driver", "serial_driver.elf", priority=100, cpu=0)
     serial_virt_tx = ProtectionDomain("serial_virt_tx", "serial_virt_tx.elf", priority=99, cpu=0)
     serial_system = Sddf.Serial(
-        sdf, None, serial_driver, serial_virt_tx, enable_color=False, baud_rate=board.baud_rate
+        sdf, uart_node, serial_driver, serial_virt_tx, enable_color=False, baud_rate=board.baud_rate
     )
-    serial_driver.add_ioport(SystemDescription.IoPort(0x3F8, 8, 0))
+    if is_x86:
+        serial_driver.add_ioport(SystemDescription.IoPort(0x3F8, 8, 0))
 
     ethernet_driver = ProtectionDomain(
         "ethernet_driver", "eth_driver.elf", priority=101, budget=100, period=400, cpu=0
     )
-    hw_net_rings = MemoryRegion(sdf, "hw_net_rings", 65536, paddr=0x7A000000)
-    sdf.add_mr(hw_net_rings)
-    ethernet_driver.add_map(Map(hw_net_rings, 0x7000_0000, "rw"))
+    if is_x86:
+        hw_net_rings = MemoryRegion(sdf, "hw_net_rings", 65536, paddr=0x7A000000)
+        sdf.add_mr(hw_net_rings)
+        ethernet_driver.add_map(Map(hw_net_rings, 0x7000_0000, "rw"))
 
-    virtio_net_regs = MemoryRegion(sdf, "virtio_net_regs", 0x4000, paddr=0xFE000000)
-    sdf.add_mr(virtio_net_regs)
-    ethernet_driver.add_map(Map(virtio_net_regs, 0x6000_0000, "rw", cached=False))
+        virtio_net_regs = MemoryRegion(sdf, "virtio_net_regs", 0x4000, paddr=0xFE000000)
+        sdf.add_mr(virtio_net_regs)
+        ethernet_driver.add_map(Map(virtio_net_regs, 0x6000_0000, "rw", cached=False))
 
-    ethernet_driver.add_irq(SystemDescription.IrqIoapic(ioapic_id=0, pin=11, vector=1, id=16))
-    ethernet_driver.add_ioport(SystemDescription.IoPort(0xCF8, 4, 1))
-    ethernet_driver.add_ioport(SystemDescription.IoPort(0xCFC, 4, 2))
+        ethernet_driver.add_irq(SystemDescription.IrqIoapic(ioapic_id=0, pin=11, vector=1, id=16))
+        ethernet_driver.add_ioport(SystemDescription.IoPort(0xCF8, 4, 1))
+        ethernet_driver.add_ioport(SystemDescription.IoPort(0xCFC, 4, 2))
+
+    elif board.name.startswith("rpi4b"):
+        # Pi 4 GENET driver waits on the timer during PHY reconfiguration and needs the
+        # VideoCore mailbox (same wiring as the sDDF echo_server example).
+        timer_system.add_client(ethernet_driver)
+        mbox = MemoryRegion(sdf, "mbox", 0x10_000, paddr=0xFE00B000)
+        sdf.add_mr(mbox)
+        ethernet_driver.add_map(Map(mbox, 0x3000000, perms="rw", cached=False))
 
     net_virt_tx = ProtectionDomain(
         "net_virt_tx", "network_virt_tx.elf", priority=100, budget=20000, cpu=0
     )
     net_virt_rx = ProtectionDomain("net_virt_rx", "network_virt_rx.elf", priority=99, cpu=0)
-    net_system = Sddf.Net(sdf, None, ethernet_driver, net_virt_tx, net_virt_rx)
+    net_system = Sddf.Net(sdf, ethernet_node, ethernet_driver, net_virt_tx, net_virt_rx)
 
     # 2. qedos Application PDs (256 KiB stack per PD for ML-KEM-768 & parser state)
     tcp_pd = ProtectionDomain(

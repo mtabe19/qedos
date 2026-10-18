@@ -396,6 +396,7 @@ void init(void)
 void notified(microkit_channel ch)
 {
     (void)ch;
+    libc_shim_set_clock_ns(shm_tcp_tls->now_ns);
     int notify_tcp = 0;
     int notify_http = 0;
     for (uint8_t s = 0; s < PG_MAX_CONNS; s++) {

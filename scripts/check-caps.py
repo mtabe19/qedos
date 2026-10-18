@@ -11,9 +11,10 @@ import sys
 import xml.etree.ElementTree as ET
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-SYS_XML = os.path.join(ROOT, "build/sel4/proofgate.system")
-VIPER_DIR = os.path.join(ROOT, "build/sel4/viper")
-SEL4_DIR = os.path.join(ROOT, "build/sel4")
+# QEDOS_SEL4_DIR selects the image directory (default build/sel4 = x86_64; e.g. build/sel4-qemu_virt_aarch64).
+SEL4_DIR = os.path.abspath(os.environ.get("QEDOS_SEL4_DIR", os.path.join(ROOT, "build/sel4")))
+SYS_XML = os.path.join(SEL4_DIR, "proofgate.system")
+VIPER_DIR = os.path.join(SEL4_DIR, "viper")
 
 APP_PDS = {"tcp_pd", "tls_pd", "http_pd", "policy_pd", "connector_pd"}
 DRIVER_PDS = {"ethernet_driver", "serial_driver", "timer_driver"}
@@ -22,6 +23,72 @@ DRIVER_PDS = {"ethernet_driver", "serial_driver", "timer_driver"}
 def fail(msg: str) -> None:
     print(f"CAP_AUDIT FAIL: {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+NON_TLS_PD_ELFS = ["http_pd.elf", "policy_pd.elf", "connector_pd.elf", "tcp_pd.elf"]
+LOADER_IMG = os.path.join(SEL4_DIR, "loader.img")
+KEY_PEM_MARK = b"-----BEGIN PRIVATE KEY-----"
+CERT_PEM_MARK = b"-----BEGIN CERTIFICATE-----"
+# `.tls_keystore` layout produced by scripts/build-sel4.sh: cert.ljust(2048) + key.ljust(2048)
+KEYSTORE_CERT_SLOT = 2048
+
+
+def read_loader_image() -> bytes:
+    """Return the Microkit boot image (`loader.img`), transparently decompressing `loader.img.gz`."""
+    if os.path.isfile(LOADER_IMG):
+        return open(LOADER_IMG, "rb").read()
+    if os.path.isfile(LOADER_IMG + ".gz"):
+        import gzip
+
+        with gzip.open(LOADER_IMG + ".gz", "rb") as fh:
+            return fh.read()
+    fail(f"missing {LOADER_IMG} / {LOADER_IMG}.gz (run scripts/build-sel4.sh first)")
+    return b""  # unreachable
+
+
+def audit_private_key_isolation() -> str:
+    """LAW_008: the TLS private key must live only in `tls_pd`'s `.tls_keystore`.
+
+    Full-build mode (Linux dev host after scripts/build-sel4.sh): every non-TLS PD ELF is scanned
+    and must not contain PEM private-key material.
+
+    Prebuilt-image mode (e.g. macOS using the committed `loader.img.gz`, where the per-PD ELFs are
+    not shipped): the flattened boot image is scanned instead. The PEM private key must occur exactly
+    once, and that single occurrence must sit at the `.tls_keystore` layout offset (certificate slot
+    followed by key slot), i.e. inside the one region that `proofgate.system` maps only into `tls_pd`.
+    """
+    present = [e for e in NON_TLS_PD_ELFS if os.path.isfile(os.path.join(SEL4_DIR, e))]
+    for elf_name in present:
+        blob = open(os.path.join(SEL4_DIR, elf_name), "rb").read()
+        if b"BEGIN PRIVATE KEY" in blob:
+            fail(f"LAW_008 violated: private key material found inside {elf_name}!")
+    if len(present) == len(NON_TLS_PD_ELFS):
+        return "pd-elf"
+
+    img = read_loader_image()
+    key_offsets = []
+    pos = img.find(KEY_PEM_MARK)
+    while pos != -1:
+        key_offsets.append(pos)
+        pos = img.find(KEY_PEM_MARK, pos + 1)
+    if len(key_offsets) != 1:
+        fail(
+            f"LAW_008 violated: expected exactly 1 private-key PEM in loader image "
+            f"(tls_pd .tls_keystore), found {len(key_offsets)} at {key_offsets}"
+        )
+    k = key_offsets[0]
+    cert_off = k - KEYSTORE_CERT_SLOT
+    if cert_off < 0 or img[cert_off : cert_off + len(CERT_PEM_MARK)] != CERT_PEM_MARK:
+        fail(
+            "LAW_008 violated: private-key PEM in loader image is not at the tls_pd .tls_keystore "
+            f"layout offset (no certificate slot {KEYSTORE_CERT_SLOT} bytes before key at {k})"
+        )
+    missing = sorted(set(NON_TLS_PD_ELFS) - set(present))
+    print(
+        f"CAP_AUDIT NOTE: per-PD ELFs {missing} not present; scanned prebuilt loader image "
+        f"({len(img)} bytes) instead — private key occurs once, at tls_pd .tls_keystore offset {k}."
+    )
+    return "loader-image"
 
 
 def main() -> None:
@@ -68,14 +135,8 @@ def main() -> None:
     if pd_maps["tls_pd"]["tls_keystore"] != "r":
         fail(f"LAW_008 violated: tls_keystore has perms={pd_maps['tls_pd']['tls_keystore']}, expected 'r'")
 
-    # Check compiled PD ELF binaries: private key PEM must NOT appear in any non-TLS PD ELF
-    for elf_name in ["http_pd.elf", "policy_pd.elf", "connector_pd.elf", "tcp_pd.elf"]:
-        elf_path = os.path.join(SEL4_DIR, elf_name)
-        if not os.path.isfile(elf_path):
-            fail(f"missing {elf_path}")
-        blob = open(elf_path, "rb").read()
-        if b"BEGIN PRIVATE KEY" in blob:
-            fail(f"LAW_008 violated: private key material found inside {elf_name}!")
+    # Check compiled PD binaries: private key PEM must NOT appear in any non-TLS PD
+    key_scan_mode = audit_private_key_isolation()
 
     # 2. LAW_011: Signed config (`shm_signed_config`) mapped ONLY in `policy_pd` (read-only)
     cfg_holders = [pd for pd, mrs in pd_maps.items() if "shm_signed_config" in mrs]
@@ -138,7 +199,8 @@ def main() -> None:
 
     print(
         f"CAP_AUDIT PASS: verified {len(pd_maps)} PDs, {len(channels)} channels, "
-        f"and {len(pd_maps)} Viper (.vpr) capability models (LAW_008, LAW_011, LAW_012)."
+        f"and {len(pd_maps)} Viper (.vpr) capability models (LAW_008, LAW_011, LAW_012); "
+        f"private-key isolation checked via {key_scan_mode}."
     )
 
 

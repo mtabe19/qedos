@@ -28,10 +28,23 @@ _OPENSSL_CANDIDATES = [
 ]
 OPENSSL = next((p for p in _OPENSSL_CANDIDATES if os.path.isfile(p)), "openssl")
 OPENSSL_CONF = os.path.join(ROOT, "config/openssl-min.cnf")
-LOADER_IMG = os.path.join(ROOT, "build/sel4/loader.img")
-SERIAL_LOG = os.path.join(ROOT, "build/sel4/serial.log")
-BE1_LOG = os.path.join(ROOT, "build/sel4/be1.log")
-BE2_LOG = os.path.join(ROOT, "build/sel4/be2.log")
+# QEDOS_ARCH=aarch64 runs the same suite against the aarch64 image (QEDOS_BOARD, default qemu_virt_aarch64).
+ARCH = os.environ.get("QEDOS_ARCH", "x86_64")
+if ARCH == "aarch64":
+    IMG_DIR = os.path.join(ROOT, "build/sel4-" + os.environ.get("QEDOS_BOARD", "qemu_virt_aarch64"))
+    QEMU_LAUNCHER = os.path.join(ROOT, "tools/run-aarch64.sh")
+    BOOT_TIMEOUT = 90.0
+    QEMU_RUN_SECONDS = "300"
+else:
+    IMG_DIR = os.path.join(ROOT, "build/sel4")
+    QEMU_LAUNCHER = os.path.join(ROOT, "tools/run-echo.sh")
+    BOOT_TIMEOUT = 25.0
+    QEMU_RUN_SECONDS = "90"
+os.environ["QEDOS_SEL4_DIR"] = IMG_DIR  # consumed by scripts/check-caps.py
+LOADER_IMG = os.path.join(IMG_DIR, "loader.img")
+SERIAL_LOG = os.path.join(IMG_DIR, "serial.log")
+BE1_LOG = os.path.join(IMG_DIR, "be1.log")
+BE2_LOG = os.path.join(IMG_DIR, "be2.log")
 GUEST_PORT = 18443
 
 
@@ -80,17 +93,17 @@ def main() -> None:
     )
     qemu = subprocess.Popen(
         [
-            os.path.join(ROOT, "tools/run-echo.sh"),
+            QEMU_LAUNCHER,
             LOADER_IMG,
             SERIAL_LOG,
             f"hostfwd=tcp::{GUEST_PORT}-10.0.2.15:8443",
-            "90",
+            QEMU_RUN_SECONDS,
         ]
     )
 
     try:
         # Wait for all PDs and DHCP lease in serial.log
-        deadline = time.time() + 25.0
+        deadline = time.time() + BOOT_TIMEOUT
         ready = False
         while time.time() < deadline:
             slog = read_serial()

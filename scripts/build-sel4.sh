@@ -4,14 +4,38 @@
 set -eu
 
 R=$(cd "$(dirname "$0")/.." && pwd)
-export PATH="$HOME/.cargo/bin:$R/tools/conda/bin:$PATH"
+cd "$R"
+export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/opt/lld/bin:/opt/homebrew/opt/llvm/bin:$R/third_party/venv/bin:$R/tools/conda/bin:$PATH"
+
+# QEDOS_ARCH=x86_64 (default, output build/sel4) or aarch64 (output build/sel4-$QEDOS_BOARD).
+# QEDOS_BOARD defaults to x86_64_generic / qemu_virt_aarch64 (also: rpi4b_1gb).
+ARCH=${QEDOS_ARCH:-x86_64}
+case "$ARCH" in
+  x86_64)
+    BOARD=${QEDOS_BOARD:-x86_64_generic}
+    RUST_TARGET=x86_64-unknown-none
+    CLANG_TARGET="-target x86_64-none-elf"
+    ARCH_CFLAGS="-mno-red-zone"
+    OPENSSL_SEL4="$R/third_party/openssl-sel4"
+    ECHO_DIR="$R/build/echo"
+    OUT="$R/build/sel4"
+    ;;
+  aarch64)
+    BOARD=${QEDOS_BOARD:-qemu_virt_aarch64}
+    RUST_TARGET=aarch64-unknown-none
+    CLANG_TARGET="-target aarch64-none-elf"
+    ARCH_CFLAGS="-mcpu=cortex-a53"
+    OPENSSL_SEL4="$R/third_party/openssl-sel4-aarch64"
+    ECHO_DIR="$R/build/echo-$BOARD"
+    OUT="$R/build/sel4-$BOARD"
+    ;;
+  *) echo "unsupported QEDOS_ARCH=$ARCH" >&2; exit 1 ;;
+esac
 
 MICROKIT_SDK="$R/third_party/microkit/microkit-sdk-2.3.1"
-BOARD_DIR="$MICROKIT_SDK/board/x86_64_generic/debug"
+BOARD_DIR="$MICROKIT_SDK/board/$BOARD/debug"
 MICROKIT_TOOL="$MICROKIT_SDK/bin/microkit"
 SDDF="$R/third_party/sddf"
-OPENSSL_SEL4="$R/third_party/openssl-sel4"
-OUT="$R/build/sel4"
 
 mkdir -p "$OUT" "$OUT/viper"
 
@@ -20,22 +44,25 @@ if [ ! -f "$R/config/sel4/proxy.sconf" ]; then
   "$R/scripts/sign-config.sh"
 fi
 if [ ! -f "$OPENSSL_SEL4/lib/libssl.a" ]; then
-  "$R/scripts/build-openssl-sel4.sh"
+  QEDOS_ARCH="$ARCH" "$R/scripts/build-openssl-sel4.sh"
+fi
+if [ "$ARCH" = aarch64 ] && [ ! -f "$ECHO_DIR/eth_driver.elf" ]; then
+  QEDOS_BOARD="$BOARD" "$R/scripts/build-sddf.sh"
 fi
 
 # 2. Build the Rust `#![no_std]` static library (`libpg_sel4_pds.a`) for x86_64-unknown-none
-cargo build --manifest-path "$R/sel4/rust_pds/Cargo.toml" --target x86_64-unknown-none --release
-RUST_PDS_A="$R/sel4/rust_pds/target/x86_64-unknown-none/release/libpg_sel4_pds.a"
+cargo build --manifest-path "$R/sel4/rust_pds/Cargo.toml" --target "$RUST_TARGET" --release
+RUST_PDS_A="$R/sel4/rust_pds/target/$RUST_TARGET/release/libpg_sel4_pds.a"
 
 # 3. Copy prebuilt sDDF driver ELFs & libraries from build/echo into build/sel4
 for f in eth_driver.elf network_virt_rx.elf network_virt_tx.elf network_copy.elf \
          timer_driver.elf serial_driver.elf serial_virt_tx.elf \
          libsddf_util.a libsddf_util_debug.a lib_sddf_lwip_echo.a; do
-  cp "$R/build/echo/$f" "$OUT/$f"
+  cp "$ECHO_DIR/$f" "$OUT/$f"
 done
 
 # 4. Compile freestanding libc shim
-COMMON_CFLAGS="-target x86_64-none-elf -ffreestanding -mno-red-zone -fno-stack-protector -O2 -g3 -Wall -Wno-unused-function -I$BOARD_DIR/include -I$R/sel4/include"
+COMMON_CFLAGS="$CLANG_TARGET $ARCH_CFLAGS -ffreestanding -fno-stack-protector -O2 -g3 -Wall -Wno-unused-function -I$BOARD_DIR/include -I$R/sel4/include"
 
 clang $COMMON_CFLAGS -Isel4/libc_shim/include -I"$OPENSSL_SEL4/include" \
   -c "$R/sel4/libc_shim/libc_shim.c" -o "$OUT/libc_shim.o"
@@ -63,7 +90,9 @@ for pd in http_pd policy_pd connector_pd; do
 done
 
 # 8. Generate `proofgate.system` and sDDF `.data` sections, then patch ELFs
-python3 "$R/sel4/meta_proofgate.py" --sddf "$SDDF" --output "$OUT" --sdf proofgate.system
+DTB_ARG=""
+[ "$ARCH" = aarch64 ] && DTB_ARG="--dtb $ECHO_DIR/$BOARD.dtb"
+python3 "$R/sel4/meta_proofgate.py" --sddf "$SDDF" --output "$OUT" --sdf proofgate.system --board "$BOARD" $DTB_ARG
 
 cp "$OUT/network_copy.elf" "$OUT/network_copy0.elf"
 llvm-objcopy --update-section .device_resources="$OUT/serial_driver_device_resources.data" "$OUT/serial_driver.elf"
@@ -104,7 +133,7 @@ llvm-objcopy --update-section .tls_keystore="$OUT/tls_keystore.data" "$OUT/tls_p
 #    and formal Viper capability invariants (`build/sel4/viper/*.vpr`)
 "$MICROKIT_TOOL" "$OUT/proofgate.system" \
   --search-path "$OUT" \
-  --board x86_64_generic \
+  --board "$BOARD" \
   --config debug \
   --viper-output "$OUT/viper" \
   -o "$OUT/loader.img" \

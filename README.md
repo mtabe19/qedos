@@ -42,3 +42,7 @@ python3 tests/test_sel4.py
 cargo test --workspace --exclude pg-load
 python3 scripts/check-caps.py
 ```
+
+## aarch64 / Raspberry Pi 4 (experimental)
+QEDOS also builds for aarch64: the full 6-test seL4 suite passes on QEMU `virt`, and a Raspberry Pi 4 image builds (not yet booted on hardware).
+**The aarch64 entropy source is a development placeholder, not secure.** See `docs/AARCH64.md` before use.

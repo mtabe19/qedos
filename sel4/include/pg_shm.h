@@ -33,8 +33,19 @@
 #define PG_MAX_RESP_RAW 32768u
 #define PG_MAX_BACKENDS 8u
 
-/* Explicit compiler + CPU fence for x86_64 SMP/IPC ring synchronization */
+/*
+ * Fence for SMP/IPC ring synchronization.
+ *   x86_64: TSO already orders store->store and load->load, a compiler barrier suffices.
+ *   aarch64: weakly ordered; a real inner-shareable barrier is REQUIRED so that payload writes
+ *            are visible before the head/tail/seq index update (and vice versa on the reader).
+ */
+#if defined(__x86_64__)
 #define PG_FENCE() __asm__ __volatile__("" ::: "memory")
+#elif defined(__aarch64__)
+#define PG_FENCE() __asm__ __volatile__("dmb ish" ::: "memory")
+#else
+#error "pg_shm.h: unsupported architecture"
+#endif
 
 /* =========================================================================
  * 1. shm_tcp_tls: Socket-over-SHM between tcp_pd and tls_pd
@@ -59,6 +70,10 @@ typedef struct {
 
 typedef struct {
     pg_tcp_tls_slot_t slots[PG_MAX_CONNS];
+    /* Monotonic nanoseconds from the sDDF timer, written by tcp_pd every timer tick. Placed after
+     * the slots so existing offsets are unchanged. tls_pd has no timer client and, on aarch64,
+     * EL0 cannot read CNTVCT_EL0 under seL4 hypervisor mode, so this is its only time source. */
+    volatile uint64_t now_ns;
 } pg_shm_tcp_tls_t;
 
 /* =========================================================================

@@ -727,12 +727,42 @@ struct shim_timespec {
 static int64_t base_epoch_sec = 1792281600LL;
 static uint64_t base_tsc = 0;
 
+#if defined(__x86_64__)
 static inline uint64_t read_tsc(void)
 {
     uint32_t lo = 0, hi = 0;
     __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
     return ((uint64_t)hi << 32) | lo;
 }
+/* Assume ~2.5 GHz nominal TSC for monotonic sub-second progression */
+#define SHIM_COUNTER_HZ 2500000000ULL
+#elif defined(__aarch64__)
+/*
+ * Under seL4 hypervisor mode (Microkit qemu_virt_aarch64 / rpi4b) EL0 may NOT read CNTVCT_EL0:
+ * the access traps and kills the PD. Time is therefore pushed in by the owning PD via
+ * libc_shim_set_clock_ns() (tls_pd receives sddf timer nanoseconds from tcp_pd through shm).
+ */
+static volatile uint64_t shim_clock_ns = 0;
+static inline uint64_t read_tsc(void)
+{
+    return shim_clock_ns;
+}
+#define SHIM_COUNTER_HZ 1000000000ULL
+#else
+#error "libc_shim: unsupported architecture"
+#endif
+
+#if defined(__aarch64__)
+void libc_shim_set_clock_ns(uint64_t ns)
+{
+    shim_clock_ns = ns;
+}
+#else
+void libc_shim_set_clock_ns(uint64_t ns)
+{
+    (void)ns; /* x86_64 reads the TSC directly */
+}
+#endif
 
 void libc_shim_set_epoch(int64_t epoch_sec)
 {
@@ -746,14 +776,14 @@ static void get_current_time(int64_t *sec_out, int64_t *nsec_out)
         base_tsc = read_tsc();
     }
     uint64_t delta_cycles = read_tsc() - base_tsc;
-    /* Assume ~2.5 GHz nominal TSC for monotonic sub-second progression */
-    uint64_t delta_sec = delta_cycles / 2500000000ULL;
-    uint64_t rem_cycles = delta_cycles % 2500000000ULL;
+    uint64_t hz = SHIM_COUNTER_HZ;
+    uint64_t delta_sec = delta_cycles / hz;
+    uint64_t rem_cycles = delta_cycles % hz;
     if (sec_out != NULL) {
         *sec_out = base_epoch_sec + (int64_t)delta_sec;
     }
     if (nsec_out != NULL) {
-        *nsec_out = (int64_t)((rem_cycles * 2ULL) / 5ULL);
+        *nsec_out = (int64_t)((rem_cycles * 1000000000ULL) / hz);
     }
 }
 
@@ -848,10 +878,11 @@ WEAK struct shim_tm *gmtime(const shim_time_t *timer)
 }
 
 /* =========================================================================
- * 5. Hardware Entropy (x86_64 RDRAND + RDTSC + SplitMix64 mixing)
+ * 5. Hardware Entropy (arch RNG where available + cycle counter + SplitMix64 mixing)
  * ========================================================================= */
 static uint64_t entropy_counter = 0x9E3779B97F4A7C15ULL;
 
+#if defined(__x86_64__)
 static int cpu_has_rdrand(void)
 {
     static int cached = -1;
@@ -866,7 +897,7 @@ static int cpu_has_rdrand(void)
     return cached;
 }
 
-static uint64_t hardware_random_u64(void)
+static uint64_t arch_hw_random(void)
 {
     uint64_t rdrand_val = 0;
     if (cpu_has_rdrand()) {
@@ -883,6 +914,26 @@ static uint64_t hardware_random_u64(void)
             }
         }
     }
+    return rdrand_val;
+}
+#elif defined(__aarch64__)
+/*
+ * aarch64 has NO architectural hardware RNG before Armv8.5 FEAT_RNG (Cortex-A72 on Raspberry Pi 4
+ * and QEMU's cortex-a53/a72 models do not implement it), and an EL0 PD cannot probe ID registers.
+ * The only entropy available here is the counter mixed through SplitMix64, which is NOT a
+ * cryptographically sound seed. Development/test builds only. A production aarch64 build MUST
+ * replace this with a real source (virtio-rng on QEMU, bcm2835 RNG on Pi 4) served by a driver PD.
+ */
+#warning "QEDOS aarch64: libc_shim entropy is a DEVELOPMENT-ONLY counter-based placeholder (no hardware RNG driver yet)"
+static uint64_t arch_hw_random(void)
+{
+    return 0;
+}
+#endif
+
+static uint64_t hardware_random_u64(void)
+{
+    uint64_t rdrand_val = arch_hw_random();
     uint64_t tsc = read_tsc();
     entropy_counter += 0x9E3779B97F4A7C15ULL;
     uint64_t z = entropy_counter ^ (tsc * 0xBF58476D1CE4E5B9ULL);
@@ -960,7 +1011,11 @@ WEAK int atexit(void (*function)(void))
 WEAK void abort(void)
 {
     for (;;) {
+#if defined(__x86_64__)
         __asm__ __volatile__("ud2");
+#else
+        __asm__ __volatile__("brk #0");
+#endif
     }
 }
 
@@ -979,10 +1034,15 @@ WEAK int getpid(void)
     return 1;
 }
 
-/* Linux x86_64 __NR_getrandom == 318 */
+/* Linux __NR_getrandom: 318 on x86_64, 278 on aarch64 */
+#if defined(__x86_64__)
+#define SHIM_NR_GETRANDOM 318
+#else
+#define SHIM_NR_GETRANDOM 278
+#endif
 WEAK long syscall(long number, ...)
 {
-    if (number == 318) {
+    if (number == SHIM_NR_GETRANDOM) {
         __builtin_va_list ap;
         __builtin_va_start(ap, number);
         void *buf = __builtin_va_arg(ap, void *);
@@ -1009,6 +1069,14 @@ WEAK int nanosleep(const void *req, void *rem)
 {
     (void)req;
     (void)rem;
+    return 0;
+}
+
+/* Referenced by aarch64 OpenSSL armcap.c (OPENSSL_rndr_bytes retry back-off); never reached since
+ * getauxval() reports no HWCAP2_RNG, but must link. */
+WEAK int usleep(unsigned int usec)
+{
+    (void)usec;
     return 0;
 }
 
