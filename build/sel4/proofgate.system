@@ -1,0 +1,183 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<system>
+    <memory_region name="hpet_regs" size="0x1000" phys_addr="0xfed00000" />
+    <memory_region name="hw_net_rings" size="0x10000" phys_addr="0x7a000000" />
+    <memory_region name="virtio_net_regs" size="0x4000" phys_addr="0xfe000000" />
+    <memory_region name="generic/serial/queue/serial_driver/serial_virt_tx" size="0x1000" />
+    <memory_region name="generic/serial/data/serial_driver/serial_virt_tx" size="0x10000" />
+    <memory_region name="generic/serial/queue/serial_virt_tx/tcp_pd" size="0x1000" />
+    <memory_region name="generic/serial/data/serial_virt_tx/tcp_pd" size="0x10000" />
+    <memory_region name="generic/net/queue/ethernet_driver/net_virt_rx/free" size="0x3000" />
+    <memory_region name="generic/net/queue/ethernet_driver/net_virt_rx/active" size="0x3000" />
+    <memory_region name="generic/net/rx/data/device" size="0x100000" phys_addr="0x6ff00000" />
+    <memory_region name="generic/net/rx/virt_metadata" size="0x1000" />
+    <memory_region name="generic/net/queue/ethernet_driver/net_virt_tx/free" size="0x3000" />
+    <memory_region name="generic/net/queue/ethernet_driver/net_virt_tx/active" size="0x3000" />
+    <memory_region name="generic/net/queue/net_virt_rx/tcp_net_copier/free" size="0x3000" />
+    <memory_region name="generic/net/queue/net_virt_rx/tcp_net_copier/active" size="0x3000" />
+    <memory_region name="generic/net/queue/tcp_net_copier/tcp_pd/free" size="0x3000" />
+    <memory_region name="generic/net/queue/tcp_net_copier/tcp_pd/active" size="0x3000" />
+    <memory_region name="generic/net/rx/data/client/tcp_pd" size="0x100000" />
+    <memory_region name="generic/net/queue/net_virt_tx/tcp_pd/free" size="0x3000" />
+    <memory_region name="generic/net/queue/net_virt_tx/tcp_pd/active" size="0x3000" />
+    <memory_region name="generic/net/tx/data/client/tcp_pd" size="0x100000" phys_addr="0x6fe00000" />
+    <memory_region name="generic/net/lib_sddf_lwip/tcp_pd" size="0xe000" />
+    <memory_region name="shm_tcp_tls" size="0x40000" />
+    <memory_region name="shm_tls_http" size="0x40000" />
+    <memory_region name="shm_http_policy" size="0x10000" />
+    <memory_region name="shm_signed_config" size="0x1000" />
+    <memory_region name="shm_policy_conn" size="0x10000" />
+    <memory_region name="shm_conn_http" size="0x10000" />
+    <memory_region name="shm_tcp_conn" size="0x20000" />
+    <memory_region name="tls_keystore" size="0x2000" />
+    <protection_domain name="serial_driver" priority="100" cpu="0">
+        <program_image path="serial_driver.elf" />
+        <map mr="generic/serial/queue/serial_driver/serial_virt_tx" vaddr="0x20000000" perms="rw" />
+        <map mr="generic/serial/data/serial_driver/serial_virt_tx" vaddr="0x20001000" perms="rw" />
+        <ioport id="0" addr="1016" size="8" />
+    </protection_domain>
+    <protection_domain name="serial_virt_tx" priority="99" cpu="0">
+        <program_image path="serial_virt_tx.elf" />
+        <map mr="generic/serial/queue/serial_driver/serial_virt_tx" vaddr="0x20000000" perms="rw" />
+        <map mr="generic/serial/data/serial_driver/serial_virt_tx" vaddr="0x20001000" perms="rw" />
+        <map mr="generic/serial/queue/serial_virt_tx/tcp_pd" vaddr="0x20011000" perms="rw" />
+        <map mr="generic/serial/data/serial_virt_tx/tcp_pd" vaddr="0x20012000" perms="rw" />
+    </protection_domain>
+    <protection_domain name="ethernet_driver" priority="101" budget="100" period="400" cpu="0">
+        <program_image path="eth_driver.elf" />
+        <map mr="hw_net_rings" vaddr="0x70000000" perms="rw" cached="true" />
+        <map mr="virtio_net_regs" vaddr="0x60000000" perms="rw" cached="false" />
+        <map mr="generic/net/queue/ethernet_driver/net_virt_rx/free" vaddr="0x70010000" perms="rw" />
+        <map mr="generic/net/queue/ethernet_driver/net_virt_rx/active" vaddr="0x70013000" perms="rw" />
+        <map mr="generic/net/queue/ethernet_driver/net_virt_tx/free" vaddr="0x70016000" perms="rw" />
+        <map mr="generic/net/queue/ethernet_driver/net_virt_tx/active" vaddr="0x70019000" perms="rw" />
+        <irq pin="11" vector="1" id="16" ioapic="0" />
+        <ioport id="1" addr="3320" size="4" />
+        <ioport id="2" addr="3324" size="4" />
+    </protection_domain>
+    <protection_domain name="net_virt_tx" priority="100" budget="20000" cpu="0">
+        <program_image path="network_virt_tx.elf" />
+        <map mr="generic/net/queue/ethernet_driver/net_virt_tx/free" vaddr="0x20000000" perms="rw" />
+        <map mr="generic/net/queue/ethernet_driver/net_virt_tx/active" vaddr="0x20003000" perms="rw" />
+        <map mr="generic/net/queue/net_virt_tx/tcp_pd/free" vaddr="0x20006000" perms="rw" />
+        <map mr="generic/net/queue/net_virt_tx/tcp_pd/active" vaddr="0x20009000" perms="rw" />
+        <map mr="generic/net/tx/data/client/tcp_pd" vaddr="0x2000c000" perms="r" />
+    </protection_domain>
+    <protection_domain name="net_virt_rx" priority="99" cpu="0">
+        <program_image path="network_virt_rx.elf" />
+        <map mr="generic/net/queue/ethernet_driver/net_virt_rx/free" vaddr="0x20000000" perms="rw" />
+        <map mr="generic/net/queue/ethernet_driver/net_virt_rx/active" vaddr="0x20003000" perms="rw" />
+        <map mr="generic/net/rx/data/device" vaddr="0x20006000" perms="r" />
+        <map mr="generic/net/rx/virt_metadata" vaddr="0x20106000" perms="rw" />
+        <map mr="generic/net/queue/net_virt_rx/tcp_net_copier/free" vaddr="0x20107000" perms="rw" />
+        <map mr="generic/net/queue/net_virt_rx/tcp_net_copier/active" vaddr="0x2010a000" perms="rw" />
+    </protection_domain>
+    <protection_domain name="timer_driver" priority="102" passive="true" cpu="0">
+        <program_image path="timer_driver.elf" />
+        <map mr="hpet_regs" vaddr="0x50000000" perms="rw" cached="false" />
+        <irq pin="2" vector="107" id="0" ioapic="0" trigger="edge" />
+    </protection_domain>
+    <protection_domain name="tcp_net_copier" priority="98" budget="20000" cpu="0">
+        <program_image path="network_copy0.elf" />
+        <map mr="generic/net/queue/net_virt_rx/tcp_net_copier/free" vaddr="0x20000000" perms="rw" />
+        <map mr="generic/net/queue/net_virt_rx/tcp_net_copier/active" vaddr="0x20003000" perms="rw" />
+        <map mr="generic/net/queue/tcp_net_copier/tcp_pd/free" vaddr="0x20006000" perms="rw" />
+        <map mr="generic/net/queue/tcp_net_copier/tcp_pd/active" vaddr="0x20009000" perms="rw" />
+        <map mr="generic/net/rx/data/device" vaddr="0x2000c000" perms="rw" />
+        <map mr="generic/net/rx/data/client/tcp_pd" vaddr="0x2010c000" perms="rw" />
+    </protection_domain>
+    <protection_domain name="tcp_pd" priority="97" budget="20000" stack_size="0x40000" cpu="0">
+        <program_image path="tcp_pd.elf" />
+        <map mr="generic/serial/queue/serial_virt_tx/tcp_pd" vaddr="0x20000000" perms="rw" />
+        <map mr="generic/serial/data/serial_virt_tx/tcp_pd" vaddr="0x20001000" perms="rw" />
+        <map mr="generic/net/queue/tcp_net_copier/tcp_pd/free" vaddr="0x20011000" perms="rw" />
+        <map mr="generic/net/queue/tcp_net_copier/tcp_pd/active" vaddr="0x20014000" perms="rw" />
+        <map mr="generic/net/rx/data/client/tcp_pd" vaddr="0x20017000" perms="rw" />
+        <map mr="generic/net/queue/net_virt_tx/tcp_pd/free" vaddr="0x20117000" perms="rw" />
+        <map mr="generic/net/queue/net_virt_tx/tcp_pd/active" vaddr="0x2011a000" perms="rw" />
+        <map mr="generic/net/tx/data/client/tcp_pd" vaddr="0x2011d000" perms="rw" />
+        <map mr="generic/net/lib_sddf_lwip/tcp_pd" vaddr="0x2021d000" perms="rw" />
+        <map mr="shm_tcp_tls" vaddr="0x30000000" perms="rw" cached="true" />
+        <map mr="shm_tcp_conn" vaddr="0x36000000" perms="rw" cached="true" />
+    </protection_domain>
+    <protection_domain name="tls_pd" priority="96" budget="20000" stack_size="0x40000" cpu="0">
+        <program_image path="tls_pd.elf" />
+        <map mr="shm_tcp_tls" vaddr="0x30000000" perms="rw" cached="true" />
+        <map mr="tls_keystore" vaddr="0x37000000" perms="r" cached="true" />
+        <map mr="shm_tls_http" vaddr="0x31000000" perms="rw" cached="true" />
+    </protection_domain>
+    <protection_domain name="http_pd" priority="95" budget="20000" stack_size="0x40000" cpu="0">
+        <program_image path="http_pd.elf" />
+        <map mr="shm_tls_http" vaddr="0x31000000" perms="rw" cached="true" />
+        <map mr="shm_http_policy" vaddr="0x32000000" perms="rw" cached="true" />
+        <map mr="shm_conn_http" vaddr="0x35000000" perms="rw" cached="true" />
+    </protection_domain>
+    <protection_domain name="policy_pd" priority="94" budget="20000" stack_size="0x40000" cpu="0">
+        <program_image path="policy_pd.elf" />
+        <map mr="shm_http_policy" vaddr="0x32000000" perms="rw" cached="true" />
+        <map mr="shm_signed_config" vaddr="0x33000000" perms="r" cached="true" />
+        <map mr="shm_policy_conn" vaddr="0x34000000" perms="rw" cached="true" />
+    </protection_domain>
+    <protection_domain name="connector_pd" priority="93" budget="20000" stack_size="0x40000" cpu="0">
+        <program_image path="connector_pd.elf" />
+        <map mr="shm_policy_conn" vaddr="0x34000000" perms="rw" cached="true" />
+        <map mr="shm_conn_http" vaddr="0x35000000" perms="rw" cached="true" />
+        <map mr="shm_tcp_conn" vaddr="0x36000000" perms="rw" cached="true" />
+    </protection_domain>
+    <channel>
+        <end pd="serial_driver" id="1" />
+        <end pd="serial_virt_tx" id="0" />
+    </channel>
+    <channel>
+        <end pd="serial_virt_tx" id="1" />
+        <end pd="tcp_pd" id="0" />
+    </channel>
+    <channel>
+        <end pd="ethernet_driver" id="0" />
+        <end pd="net_virt_rx" id="0" />
+    </channel>
+    <channel>
+        <end pd="ethernet_driver" id="3" />
+        <end pd="net_virt_tx" id="0" />
+    </channel>
+    <channel>
+        <end pd="net_virt_rx" id="1" />
+        <end pd="tcp_net_copier" id="0" />
+    </channel>
+    <channel>
+        <end pd="tcp_net_copier" id="1" />
+        <end pd="tcp_pd" id="1" />
+    </channel>
+    <channel>
+        <end pd="net_virt_tx" id="1" />
+        <end pd="tcp_pd" id="2" />
+    </channel>
+    <channel>
+        <end pd="timer_driver" id="1" />
+        <end pd="tcp_pd" id="3" notify="false" pp="true" />
+    </channel>
+    <channel>
+        <end pd="tcp_pd" id="10" />
+        <end pd="tls_pd" id="1" />
+    </channel>
+    <channel>
+        <end pd="tls_pd" id="2" />
+        <end pd="http_pd" id="1" />
+    </channel>
+    <channel>
+        <end pd="http_pd" id="2" />
+        <end pd="policy_pd" id="1" />
+    </channel>
+    <channel>
+        <end pd="policy_pd" id="2" />
+        <end pd="connector_pd" id="1" />
+    </channel>
+    <channel>
+        <end pd="connector_pd" id="2" />
+        <end pd="http_pd" id="3" />
+    </channel>
+    <channel>
+        <end pd="connector_pd" id="3" />
+        <end pd="tcp_pd" id="11" />
+    </channel>
+</system>

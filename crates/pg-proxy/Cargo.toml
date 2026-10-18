@@ -1,0 +1,17 @@
+[package]
+name = "pg-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ProofGate host reference proxy: PQC-hybrid-only TLS 1.3 HTTPS reverse proxy"
+
+[dependencies]
+pg-http = { path = "../pg-http" }
+pg-policy = { path = "../pg-policy" }
+pg-config = { path = "../pg-config" }
+mio = { version = "1", features = ["os-poll", "net"] }
+openssl = "0.10"
+openssl-sys = "0.9"
+libc = "0.2"
+socket2 = { version = "0.5", features = ["all"] }
+foreign-types = "0.3"

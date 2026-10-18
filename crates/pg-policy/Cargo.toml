@@ -1,0 +1,13 @@
+[package]
+name = "pg-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ProofGate fixed-route policy engine (no_std, no alloc, no unsafe)"
+
+[dependencies]
+pg-http = { path = "../pg-http" }
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }
+

@@ -1,0 +1,22 @@
+[package]
+name = "pg-sel4-pds"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+name = "pg_sel4_pds"
+crate-type = ["staticlib"]
+
+[dependencies]
+pg-http = { path = "../../crates/pg-http" }
+pg-policy = { path = "../../crates/pg-policy" }
+pg-config = { path = "../../crates/pg-config" }
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+overflow-checks = true
+lto = true
+codegen-units = 1

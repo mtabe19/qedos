@@ -1,0 +1,13 @@
+[package]
+name = "pg-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ProofGate signed configuration format and Ed25519 verification (LAW_011)"
+
+[dependencies]
+pg-http = { path = "../pg-http" }
+pg-policy = { path = "../pg-policy" }
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

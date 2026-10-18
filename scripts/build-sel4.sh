@@ -1,0 +1,113 @@
+#!/bin/sh
+# Build the complete seL4 + Microkit + sDDF + Freestanding OpenSSL 3.6.1 + Rust no_std
+# ProofGate OS multi-PD image (`build/sel4/loader.img`) and Viper capability models (`build/sel4/viper/`).
+set -eu
+
+R=$(cd "$(dirname "$0")/.." && pwd)
+export PATH="$HOME/.cargo/bin:$R/tools/conda/bin:$PATH"
+
+MICROKIT_SDK="$R/third_party/microkit/microkit-sdk-2.3.1"
+BOARD_DIR="$MICROKIT_SDK/board/x86_64_generic/debug"
+MICROKIT_TOOL="$MICROKIT_SDK/bin/microkit"
+SDDF="$R/third_party/sddf"
+OPENSSL_SEL4="$R/third_party/openssl-sel4"
+OUT="$R/build/sel4"
+
+mkdir -p "$OUT" "$OUT/viper"
+
+# 1. Ensure signed configs and freestanding OpenSSL exist
+if [ ! -f "$R/config/sel4/proxy.sconf" ]; then
+  "$R/scripts/sign-config.sh"
+fi
+if [ ! -f "$OPENSSL_SEL4/lib/libssl.a" ]; then
+  "$R/scripts/build-openssl-sel4.sh"
+fi
+
+# 2. Build the Rust `#![no_std]` static library (`libpg_sel4_pds.a`) for x86_64-unknown-none
+cargo build --manifest-path "$R/sel4/rust_pds/Cargo.toml" --target x86_64-unknown-none --release
+RUST_PDS_A="$R/sel4/rust_pds/target/x86_64-unknown-none/release/libpg_sel4_pds.a"
+
+# 3. Copy prebuilt sDDF driver ELFs & libraries from build/echo into build/sel4
+for f in eth_driver.elf network_virt_rx.elf network_virt_tx.elf network_copy.elf \
+         timer_driver.elf serial_driver.elf serial_virt_tx.elf \
+         libsddf_util.a libsddf_util_debug.a lib_sddf_lwip_echo.a; do
+  cp "$R/build/echo/$f" "$OUT/$f"
+done
+
+# 4. Compile freestanding libc shim
+COMMON_CFLAGS="-target x86_64-none-elf -ffreestanding -mno-red-zone -fno-stack-protector -O2 -g3 -Wall -Wno-unused-function -I$BOARD_DIR/include -I$R/sel4/include"
+
+clang $COMMON_CFLAGS -Isel4/libc_shim/include -I"$OPENSSL_SEL4/include" \
+  -c "$R/sel4/libc_shim/libc_shim.c" -o "$OUT/libc_shim.o"
+
+# 5. Compile & link `tcp_pd.elf` (sDDF + lwIP)
+LWIP_CFLAGS="-I$SDDF/include/sddf/util/custom_libc -I$SDDF/include/microkit -I$SDDF/include -I$SDDF/examples/echo_server/include/lwip -I$SDDF/examples/echo_server/include -I$SDDF/network/ipstacks/lwip/src/include -I$SDDF/network/ipstacks/lwip/src/include/ipv4 -Wno-tautological-constant-out-of-range-compare"
+clang $COMMON_CFLAGS $LWIP_CFLAGS -c "$R/sel4/pds/tcp_pd.c" -o "$OUT/tcp_pd.o"
+ld.lld -L"$BOARD_DIR/lib" --start-group \
+  "$OUT/tcp_pd.o" "$OUT/libsddf_util.a" "$OUT/libsddf_util_debug.a" "$OUT/lib_sddf_lwip_echo.a" \
+  -lmicrokit -Tmicrokit.ld --end-group -o "$OUT/tcp_pd.elf"
+
+# 6. Compile & link `tls_pd.elf` (Freestanding OpenSSL 3.6.1, TLS 1.3 + X25519MLKEM768 only)
+clang $COMMON_CFLAGS -I"$R/sel4/libc_shim" -I"$R/sel4/libc_shim/include" -I"$OPENSSL_SEL4/include" \
+  -c "$R/sel4/pds/tls_pd.c" -o "$OUT/tls_pd.o"
+ld.lld -L"$BOARD_DIR/lib" --start-group \
+  "$OUT/tls_pd.o" "$OUT/libc_shim.o" "$OPENSSL_SEL4/lib/libssl.a" "$OPENSSL_SEL4/lib/libcrypto.a" \
+  -lmicrokit -Tmicrokit.ld --end-group -o "$OUT/tls_pd.elf"
+
+# 7. Compile & link `http_pd.elf`, `policy_pd.elf`, `connector_pd.elf` (Rust `#![no_std]` crates)
+for pd in http_pd policy_pd connector_pd; do
+  clang $COMMON_CFLAGS -Isel4/libc_shim/include -c "$R/sel4/pds/${pd}.c" -o "$OUT/${pd}.o"
+  ld.lld -L"$BOARD_DIR/lib" --start-group \
+    "$OUT/${pd}.o" "$OUT/libc_shim.o" "$RUST_PDS_A" \
+    -lmicrokit -Tmicrokit.ld --end-group -o "$OUT/${pd}.elf"
+done
+
+# 8. Generate `proofgate.system` and sDDF `.data` sections, then patch ELFs
+python3 "$R/sel4/meta_proofgate.py" --sddf "$SDDF" --output "$OUT" --sdf proofgate.system
+
+cp "$OUT/network_copy.elf" "$OUT/network_copy0.elf"
+llvm-objcopy --update-section .device_resources="$OUT/serial_driver_device_resources.data" "$OUT/serial_driver.elf"
+llvm-objcopy --update-section .serial_driver_config="$OUT/serial_driver_config.data" "$OUT/serial_driver.elf"
+llvm-objcopy --update-section .serial_virt_tx_config="$OUT/serial_virt_tx.data" "$OUT/serial_virt_tx.elf"
+llvm-objcopy --update-section .device_resources="$OUT/ethernet_driver_device_resources.data" "$OUT/eth_driver.elf"
+llvm-objcopy --update-section .net_driver_config="$OUT/net_driver.data" "$OUT/eth_driver.elf"
+llvm-objcopy --update-section .net_virt_rx_config="$OUT/net_virt_rx.data" "$OUT/network_virt_rx.elf"
+llvm-objcopy --update-section .net_virt_tx_config="$OUT/net_virt_tx.data" "$OUT/network_virt_tx.elf"
+llvm-objcopy --update-section .net_copy_config="$OUT/net_copy_tcp_net_copier.data" "$OUT/network_copy0.elf"
+llvm-objcopy --update-section .device_resources="$OUT/timer_driver_device_resources.data" "$OUT/timer_driver.elf"
+llvm-objcopy --update-section .timer_client_config="$OUT/timer_client_tcp_pd.data" "$OUT/tcp_pd.elf"
+llvm-objcopy --update-section .net_client_config="$OUT/net_client_tcp_pd.data" "$OUT/tcp_pd.elf"
+llvm-objcopy --update-section .serial_client_config="$OUT/serial_client_tcp_pd.data" "$OUT/tcp_pd.elf"
+llvm-objcopy --update-section .lib_sddf_lwip_config="$OUT/lib_sddf_lwip_config_tcp_pd.data" "$OUT/tcp_pd.elf"
+
+# Inject the Ed25519-signed configuration (`config/sel4/proxy.sconf`, padded to 512B) into `policy_pd.elf`
+python3 - "$R/config/sel4/proxy.sconf" "$OUT/signed_config.data" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+data = open(src, "rb").read()
+assert len(data) <= 512
+open(dst, "wb").write(data.ljust(512, b"\x00"))
+PY
+llvm-objcopy --update-section .signed_config="$OUT/signed_config.data" "$OUT/policy_pd.elf"
+
+# Inject TLS cert/key into `tls_pd.elf` `.tls_keystore` section ONLY (LAW_008)
+python3 - "$R/config/dev/cert.pem" "$R/config/dev/key.pem" "$OUT/tls_keystore.data" <<'PY'
+import sys
+cert = open(sys.argv[1], "rb").read()
+key = open(sys.argv[2], "rb").read()
+assert len(cert) < 2048 and len(key) < 2048
+open(sys.argv[3], "wb").write(cert.ljust(2048, b"\x00") + key.ljust(2048, b"\x00"))
+PY
+llvm-objcopy --update-section .tls_keystore="$OUT/tls_keystore.data" "$OUT/tls_pd.elf"
+
+# 9. Build the bootable seL4 Microkit image (`loader.img`), memory report (`report.txt`),
+#    and formal Viper capability invariants (`build/sel4/viper/*.vpr`)
+"$MICROKIT_TOOL" "$OUT/proofgate.system" \
+  --search-path "$OUT" \
+  --board x86_64_generic \
+  --config debug \
+  --viper-output "$OUT/viper" \
+  -o "$OUT/loader.img" \
+  -r "$OUT/report.txt"
+
+ls -lh "$OUT/loader.img" "$OUT/report.txt" "$OUT/viper/"

@@ -1,0 +1,6 @@
+# Pin the OpenSSL that is linked into pg-proxy to the in-tree 3.6.1 build
+# (scripts/build-openssl.sh). The distro OpenSSL (3.0.x) has no ML-KEM.
+[env]
+OPENSSL_DIR = { value = "third_party/openssl-install", relative = true, force = true }
+OPENSSL_STATIC = { value = "1", force = true }
+OPENSSL_NO_VENDOR = { value = "1", force = true }

@@ -1,0 +1,28 @@
+# Rust build outputs
+/target/
+/sel4/rust_pds/target/
+
+# Local toolchains & heavy third-party builds
+/tools/conda/
+/tools/qemu/
+/third_party/*
+!/third_party/openssl-3.6.1.tar.gz.sha256
+
+# Build artifacts (keep formal verification & benchmark evidence)
+/build/*
+!/build/kani/
+!/build/perf/
+!/build/sel4/
+/build/sel4/*
+!/build/sel4/proofgate.system
+!/build/sel4/report.txt
+!/build/sel4/viper/
+
+# Compiled objects and test runners in sel4/libc_shim
+/sel4/libc_shim/*.o
+/sel4/libc_shim/*.elf
+/sel4/libc_shim/test_tls_shim_runner
+
+# Python cache
+__pycache__/
+*.pyc
