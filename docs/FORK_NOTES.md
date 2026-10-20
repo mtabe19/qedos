@@ -25,7 +25,9 @@ GitHub の「Sync fork」ボタンでも main は更新できる。
 
 1. **公開リポジトリである**: 本番用の証明書・秘密鍵・署名鍵、AWS のアカウント ID・インスタンス ID・EIP などはコミットしない。
    `config/dev`・`config/keys` は上流が開発用として公開しているもので問題ない
-2. **PR の送り先**: fork で PR を作ると base が既定で上流 (shi3z/qedos) になることがある。自分用の PR は base を `mtabe19/qedos` にする
+2. **PR の送り先**: fork で PR を作ると base が既定で上流 (shi3z/qedos) になることがある。自分用の PR は base を `mtabe19/qedos` にする。
+   push 直後に出る黄色いバナー「had recent pushes / Compare & pull request」は本人にだけ表示される
+   (ログアウト状態で確認、2026-10-20)。`Compare & pull request` は押さない
 3. **上流への通知**: issue・コメント・PR は作者に通知が飛ぶ。内容がまとまるまで送らない
 4. **脆弱性を見つけたら**: 上流の Security policy に従い、公開 issue ではなく非公開で報告する
 5. **公式と誤解されないようにする**: README 先頭の非公式 fork の注記は必要になったら入れる
@@ -41,5 +43,5 @@ GitHub の「Sync fork」ボタンでも main は更新できる。
 
 ## 関連
 
-- Stage E (EC2) の記録: `docs/STAGE_E_EC2.md` (作成予定)
+- Stage E (EC2) の記録: `docs/STAGE_E_EC2.md`
 - 上流の bare-metal 計画: `docs/X86_BAREMETAL_PLAN.md`
