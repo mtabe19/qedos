@@ -40,8 +40,19 @@ else:
     QEMU_LAUNCHER = os.path.join(ROOT, "tools/run-echo.sh")
     BOOT_TIMEOUT = 25.0
     QEMU_RUN_SECONDS = "90"
+# mtabe19/qedos fork: QEDOS_BOOT=disk boots the GRUB disk image from tools/mk-grub-disk.sh
+# (SeaBIOS -> GRUB -> seL4) instead of QEMU -kernel/-initrd. Default behaviour is unchanged.
+BOOT_MODE = os.environ.get("QEDOS_BOOT", "kernel")
+if BOOT_MODE == "disk":
+    if ARCH != "x86_64":
+        raise SystemExit("QEDOS_BOOT=disk is only supported for x86_64")
+    QEMU_LAUNCHER = os.path.join(ROOT, "tools/run-disk.sh")
+    BOOT_TIMEOUT = 120.0
+    QEMU_RUN_SECONDS = "240"
 os.environ["QEDOS_SEL4_DIR"] = IMG_DIR  # consumed by scripts/check-caps.py
 LOADER_IMG = os.path.join(IMG_DIR, "loader.img")
+DISK_IMG = os.environ.get("QEDOS_DISK_IMG", os.path.join(ROOT, "build/disk/qedos-bios.img"))
+BOOT_IMG = DISK_IMG if BOOT_MODE == "disk" else LOADER_IMG
 SERIAL_LOG = os.path.join(IMG_DIR, "serial.log")
 BE1_LOG = os.path.join(IMG_DIR, "be1.log")
 BE2_LOG = os.path.join(IMG_DIR, "be2.log")
@@ -94,7 +105,7 @@ def main() -> None:
     qemu = subprocess.Popen(
         [
             QEMU_LAUNCHER,
-            LOADER_IMG,
+            BOOT_IMG,
             SERIAL_LOG,
             f"hostfwd=tcp::{GUEST_PORT}-10.0.2.15:8443",
             QEMU_RUN_SECONDS,
