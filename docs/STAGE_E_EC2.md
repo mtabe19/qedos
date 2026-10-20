@@ -9,9 +9,9 @@ QEDOS を AWS EC2 (Nitro, x86_64) 上で直接起動するための記録。
 | 項目 | 内容 |
 |---|---|
 | ターゲット | EC2 t3 系 (Nitro, Intel)。Legacy BIOS 起動。NIC は ENA、ディスクは NVMe |
-| 開発機 | Mac (Apple Silicon)。QEMU は TCG。KVM での確認は C8i 系 (nested virtualization) で行う予定 |
+| 開発機 | Mac (Apple Silicon): ソースの編集、EC2 の操作、QEMU (TCG) での確認。x86_64 のビルドは Intel Mac の VMware 上の Ubuntu 24.04 VM (2.5)。KVM での確認は未実施 (VM 内で `/dev/kvm` は使える) |
 | AWS 操作 | Mac の AWS CLI (`aws login --profile qedos`)。ヘルパー用のインスタンスは使わない |
-| イメージ | 当面は上流のビルド済みイメージ (`build/sel4/loader.img.gz`, `sel4_32.elf.gz`)。x86_64 の再ビルド手順は未整備 (後述) |
+| イメージ | 上流のビルド済みイメージ (`build/sel4/loader.img.gz`, `sel4_32.elf.gz`)、または VM で再ビルドしたもの (`build/sel4-x86_64_generic/`, 2.5) |
 
 ## 2. 手順
 
@@ -65,6 +65,53 @@ tools/ec2/collect-facts.sh        # Amazon Linux 2023 を user-data 付きで起
 - 調査後 180 秒待ってから停止する (`get-console-output --latest` の更新が約 1 分ごとのため)。OS からの停止は stop、最後にスクリプトが削除する
 - `QEDOS_EC2_TYPE` で他のインスタンスタイプも調べられる
 
+### 2.5 x86_64 の再ビルド (Ubuntu VM)
+
+上流のビルド手順は Linux x86_64 前提のため、Intel Mac の VMware Fusion 上の Ubuntu 24.04 VM でビルドする
+(4 vCPU / 8GB / ディスク 60GB。インストーラは LVM の約半分しか / に割り当てないので `lvextend -l +100%FREE -r` で広げる)。
+接続はすべて Mac から VM に向けて張る (Mac のリモートログインは使わない)。以下 `<vm>` は VM のホスト名。
+
+VM の準備 (初回のみ):
+
+```sh
+sudo apt install -y build-essential clang lld llvm make git curl python3-venv perl qemu-system-x86 grub-pc-bin mtools
+curl -sSf https://sh.rustup.rs | sh -s -- -y && . ~/.cargo/env && rustup target add x86_64-unknown-none
+# Mac から rsync した後、~/qedos で
+python3 -m venv third_party/venv && third_party/venv/bin/pip install 'sdfgen==0.35.0'
+mkdir -p third_party/microkit && curl -fL https://github.com/seL4/microkit/releases/download/2.3.1/microkit-sdk-2.3.1-linux-x86-64.tar.gz | tar xz -C third_party/microkit
+scripts/build-openssl.sh          # ホスト用 OpenSSL 3.6.1 (試験の pg-proxy / openssl s_client 用。distro の 3.0 は ML-KEM 非対応)
+```
+
+ソースを送る (Mac の qedos で。`.git`・`third_party/`・`build/` は送らない):
+
+```sh
+rsync -av --delete \
+  --exclude=/.git/ --exclude=/third_party/ --exclude=/build/ \
+  --exclude=/target/ --exclude=/sel4/rust_pds/target/ \
+  --exclude=/tools/conda/ --exclude=/tools/qemu/ \
+  --exclude=__pycache__/ --exclude=.DS_Store \
+  ./ mtabe@<vm>:qedos/
+```
+
+ビルドと試験 (VM の ~/qedos で):
+
+```sh
+scripts/build-sel4.sh             # seL4 用 OpenSSL と sDDF (build/echo-x86_64_generic) も無ければ作る
+QEDOS_SEL4_DIR=build/sel4-x86_64_generic python3 tests/test_sel4.py
+QEDOS_SEL4_DIR=build/sel4-x86_64_generic tools/mk-grub-disk.sh build/disk/qedos-bios-rebuilt.img
+QEDOS_SEL4_DIR=build/sel4-x86_64_generic QEDOS_DISK_IMG=build/disk/qedos-bios-rebuilt.img QEDOS_BOOT=disk python3 tests/test_sel4.py
+```
+
+- 出力は `build/sel4-x86_64_generic/` (上流のビルド済み `build/sel4/` は比較用に残す)。`sel4_32.elf` は SDK のカーネルをコピーする
+- 新しい scp はリモート側の `{a,b}` を展開しないので、複数ファイルは rsync で取る
+
+EC2 で起動試験 (Mac で):
+
+```sh
+scp mtabe@<vm>:qedos/build/disk/qedos-bios-rebuilt.img build/disk/
+QEDOS_DISK_IMG=build/disk/qedos-bios-rebuilt.img tools/ec2/boot-test.sh
+```
+
 ## 3. 結果
 
 | Step | 内容 | 結果 (2026-10-20) |
@@ -72,6 +119,18 @@ tools/ec2/collect-facts.sh        # Amazon Linux 2023 を user-data 付きで起
 | M1-0 | 上流のビルド済みイメージで `tests/test_sel4.py` (macOS, QEMU 11.1.2 TCG) | SEL4_001..006 PASS |
 | M1-1 | GRUB ディスクイメージから起動 (SeaBIOS, multiboot2) | SEL4_001..006 PASS |
 | M1-2 | EC2 t3.medium で起動 (Legacy BIOS, EBS) | GRUB -> seL4 -> CapDL -> Microkit monitor まで起動。timer_driver と ethernet_driver で停止 (下記) |
+| M2-1 | Ubuntu 24.04 VM (clang/lld 18.1.3, Rust 1.99.1) で x86_64 を再ビルド (2.5) | sDDF echo_server、seL4 用 OpenSSL、`build-sel4.sh` とも成功 (pancake の `cake` は不要) |
+| M2-2 | 再ビルドしたイメージで `tests/test_sel4.py` (VM, QEMU 8.2.2 TCG)。`-kernel/-initrd` と GRUB ディスクの両方 | SEL4_001..006 PASS (両方) |
+| M2-3 | 再ビルドしたディスクイメージで EC2 t3.medium | M1-2 と同じ (4.1 の 2 か所で停止、tls/http/policy/connector は初期化成功) |
+
+M2 の上流ビルド済みイメージとの比較:
+
+| 項目 | 結果 |
+|---|---|
+| `sel4_32.elf` | SDK 2.3.1 のカーネルと上流のビルド済みが同一 (sha256 一致) |
+| `proofgate.system` | 同一 |
+| `report.txt` | tls_pd の ELF が 2 ページ (8KB) 小さい (5222 -> 5220 frames)。他の PD は同じ。ビルド環境の差によるものと推測 |
+| `loader.img` | 77,311,644 -> 77,303,180 バイト |
 
 M1-2 の実行メモ:
 
@@ -118,8 +177,8 @@ M1-2 の実行メモ:
 ## 5. 課題と次の手順
 
 1. ~~EC2 の構成を調べる~~ (済、4.2)
-2. **x86_64 の再ビルド** (以降すべての前提): `build-sel4.sh` は `build/echo/` のビルド済み sDDF をコピーするが、
-   リポジトリに無い。`scripts/build-sddf.sh` (aarch64 用) を x86_64_generic に対応させる
+2. ~~**x86_64 の再ビルド**~~ (済、2.5 と 3 章 M2): `build-sddf.sh` を x86_64_generic に対応させ、
+   `build-sel4.sh` は x86_64 でも sDDF を自分でビルドして `build/sel4-x86_64_generic/` に出力するようにした
 3. **タイマー**: (a) sDDF `tsc_hpet` を 32 ビット HPET (62.5MHz、約 68.7 秒で一周) に対応させる、または
    (b) TSC (不変・周波数既知) + TSC deadline タイマーを使う。上流 sDDF の新しい版で対応済みかも確認する
 4. **アドレスのプロファイル化**: `sel4/meta_proofgate.py` の QEMU 前提の値 (virtio BAR `0xFE000000`, DMA `0x7A000000`,

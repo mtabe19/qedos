@@ -36,7 +36,8 @@ if ARCH == "aarch64":
     BOOT_TIMEOUT = 90.0
     QEMU_RUN_SECONDS = "300"
 else:
-    IMG_DIR = os.path.join(ROOT, "build/sel4")
+    # mtabe19/qedos fork: QEDOS_SEL4_DIR selects a rebuilt image (e.g. build/sel4-x86_64_generic).
+    IMG_DIR = os.path.abspath(os.path.join(ROOT, os.environ.get("QEDOS_SEL4_DIR", "build/sel4")))
     QEMU_LAUNCHER = os.path.join(ROOT, "tools/run-echo.sh")
     BOOT_TIMEOUT = 25.0
     QEMU_RUN_SECONDS = "90"

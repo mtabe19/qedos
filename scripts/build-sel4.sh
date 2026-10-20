@@ -7,7 +7,9 @@ R=$(cd "$(dirname "$0")/.." && pwd)
 cd "$R"
 export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/opt/lld/bin:/opt/homebrew/opt/llvm/bin:$R/third_party/venv/bin:$R/tools/conda/bin:$PATH"
 
-# QEDOS_ARCH=x86_64 (default, output build/sel4) or aarch64 (output build/sel4-$QEDOS_BOARD).
+# QEDOS_ARCH=x86_64 (default) or aarch64. Output: build/sel4-$QEDOS_BOARD.
+# mtabe19/qedos fork: x86_64 also builds sDDF itself (scripts/build-sddf.sh) and writes to
+# build/sel4-$BOARD, so the upstream prebuilt image in build/sel4 is kept as a baseline (Stage E).
 # QEDOS_BOARD defaults to x86_64_generic / qemu_virt_aarch64 (also: rpi4b_1gb).
 ARCH=${QEDOS_ARCH:-x86_64}
 case "$ARCH" in
@@ -17,8 +19,8 @@ case "$ARCH" in
     CLANG_TARGET="-target x86_64-none-elf"
     ARCH_CFLAGS="-mno-red-zone"
     OPENSSL_SEL4="$R/third_party/openssl-sel4"
-    ECHO_DIR="$R/build/echo"
-    OUT="$R/build/sel4"
+    ECHO_DIR="$R/build/echo-$BOARD"
+    OUT="$R/build/sel4-$BOARD"
     ;;
   aarch64)
     BOARD=${QEDOS_BOARD:-qemu_virt_aarch64}
@@ -46,7 +48,7 @@ fi
 if [ ! -f "$OPENSSL_SEL4/lib/libssl.a" ]; then
   QEDOS_ARCH="$ARCH" "$R/scripts/build-openssl-sel4.sh"
 fi
-if [ "$ARCH" = aarch64 ] && [ ! -f "$ECHO_DIR/eth_driver.elf" ]; then
+if [ ! -f "$ECHO_DIR/eth_driver.elf" ]; then
   QEDOS_BOARD="$BOARD" "$R/scripts/build-sddf.sh"
 fi
 
@@ -138,5 +140,10 @@ llvm-objcopy --update-section .tls_keystore="$OUT/tls_keystore.data" "$OUT/tls_p
   --viper-output "$OUT/viper" \
   -o "$OUT/loader.img" \
   -r "$OUT/report.txt"
+
+# 10. Keep the matching seL4 kernel next to loader.img (tools/mk-grub-disk.sh uses it)
+if [ "$ARCH" = x86_64 ]; then
+  cp "$BOARD_DIR/elf/sel4_32.elf" "$OUT/sel4_32.elf"
+fi
 
 ls -lh "$OUT/loader.img" "$OUT/report.txt" "$OUT/viper/"
