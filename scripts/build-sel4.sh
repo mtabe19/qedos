@@ -13,19 +13,35 @@ export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/opt/lld
 # QEDOS_BOARD defaults to x86_64_generic / qemu_virt_aarch64 (also: rpi4b_1gb).
 ARCH=${QEDOS_ARCH:-x86_64}
 HPET_ARG=""
+PROFILE=""
+PROFILE_ARG=""
 case "$ARCH" in
   x86_64)
     BOARD=${QEDOS_BOARD:-x86_64_generic}
     # mtabe19/qedos fork: QEDOS_HPET_FORCE_32BIT=1 -> sDDF timer in 32-bit mode, output build/sel4-$BOARD-hpet32
+    ECHO_SUFFIX=""
+    if [ "${QEDOS_HPET_FORCE_32BIT:-0}" = 1 ]; then ECHO_SUFFIX=-hpet32; fi
+    # mtabe19/qedos fork: QEDOS_PROFILE=qemu (default, virtio-net) or ec2-t3 (ENA; needs QEDOS_NET_MAC, the fixed
+    # ENI's MAC). Output build/sel4-$BOARD[-ec2-t3][-hpet32]. See sel4/meta_proofgate.py --profile.
+    PROFILE=${QEDOS_PROFILE:-qemu}
+    PROFILE_ARG="--profile $PROFILE"
     SUFFIX=""
-    if [ "${QEDOS_HPET_FORCE_32BIT:-0}" = 1 ]; then SUFFIX=-hpet32; fi
+    if [ "$PROFILE" != qemu ]; then SUFFIX="-$PROFILE"; fi
+    if [ "$PROFILE" = ec2-t3 ]; then
+      if [ -z "${QEDOS_NET_MAC:-}" ]; then
+        echo "QEDOS_NET_MAC (the fixed ENI's MAC address) is required for QEDOS_PROFILE=ec2-t3" >&2
+        exit 1
+      fi
+      PROFILE_ARG="$PROFILE_ARG --mac $QEDOS_NET_MAC"
+    fi
+    SUFFIX="$SUFFIX$ECHO_SUFFIX"
     # mtabe19/qedos fork: HPET timer IRQ pin, same default as scripts/build-sddf.sh
     HPET_ARG="--hpet-ioapic-pin ${QEDOS_HPET_IOAPIC_PIN:-23}"
     RUST_TARGET=x86_64-unknown-none
     CLANG_TARGET="-target x86_64-none-elf"
     ARCH_CFLAGS="-mno-red-zone"
     OPENSSL_SEL4="$R/third_party/openssl-sel4"
-    ECHO_DIR="$R/build/echo-$BOARD$SUFFIX"
+    ECHO_DIR="$R/build/echo-$BOARD$ECHO_SUFFIX"
     OUT="$R/build/sel4-$BOARD$SUFFIX"
     ;;
   aarch64)
@@ -97,17 +113,29 @@ for pd in http_pd policy_pd connector_pd; do
     -lmicrokit -Tmicrokit.ld --end-group -o "$OUT/${pd}.elf"
 done
 
+# mtabe19/qedos fork: ENA driver for QEDOS_PROFILE=ec2-t3 (sel4/drivers/ena)
+ETH_ELF=eth_driver.elf
+if [ "$PROFILE" = ec2-t3 ]; then
+  ETH_ELF=eth_driver_ena.elf
+  clang $COMMON_CFLAGS -I"$SDDF/include" -I"$SDDF/include/microkit" -I"$SDDF/include/sddf/util/custom_libc" \
+    -c "$R/sel4/drivers/ena/ena.c" -o "$OUT/ena.o"
+  ld.lld -L"$BOARD_DIR/lib" "$OUT/ena.o" "$OUT/libsddf_util_debug.a" -lmicrokit -Tmicrokit.ld -o "$OUT/$ETH_ELF"
+fi
+
 # 8. Generate `proofgate.system` and sDDF `.data` sections, then patch ELFs
 DTB_ARG=""
 [ "$ARCH" = aarch64 ] && DTB_ARG="--dtb $ECHO_DIR/$BOARD.dtb"
-python3 "$R/sel4/meta_proofgate.py" --sddf "$SDDF" --output "$OUT" --sdf proofgate.system --board "$BOARD" $DTB_ARG $HPET_ARG
+python3 "$R/sel4/meta_proofgate.py" --sddf "$SDDF" --output "$OUT" --sdf proofgate.system --board "$BOARD" $DTB_ARG $HPET_ARG $PROFILE_ARG
 
 cp "$OUT/network_copy.elf" "$OUT/network_copy0.elf"
 llvm-objcopy --update-section .device_resources="$OUT/serial_driver_device_resources.data" "$OUT/serial_driver.elf"
 llvm-objcopy --update-section .serial_driver_config="$OUT/serial_driver_config.data" "$OUT/serial_driver.elf"
 llvm-objcopy --update-section .serial_virt_tx_config="$OUT/serial_virt_tx.data" "$OUT/serial_virt_tx.elf"
-llvm-objcopy --update-section .device_resources="$OUT/ethernet_driver_device_resources.data" "$OUT/eth_driver.elf"
-llvm-objcopy --update-section .net_driver_config="$OUT/net_driver.data" "$OUT/eth_driver.elf"
+llvm-objcopy --update-section .device_resources="$OUT/ethernet_driver_device_resources.data" "$OUT/$ETH_ELF"
+llvm-objcopy --update-section .net_driver_config="$OUT/net_driver.data" "$OUT/$ETH_ELF"
+if [ "$PROFILE" = ec2-t3 ]; then
+  llvm-objcopy --update-section .timer_client_config="$OUT/timer_client_ethernet_driver.data" "$OUT/$ETH_ELF"
+fi
 llvm-objcopy --update-section .net_virt_rx_config="$OUT/net_virt_rx.data" "$OUT/network_virt_rx.elf"
 llvm-objcopy --update-section .net_virt_tx_config="$OUT/net_virt_tx.data" "$OUT/network_virt_tx.elf"
 llvm-objcopy --update-section .net_copy_config="$OUT/net_copy_tcp_net_copier.data" "$OUT/network_copy0.elf"

@@ -115,6 +115,40 @@ scp mtabe@<vm>:qedos/build/disk/qedos-bios-rebuilt.img build/disk/
 QEDOS_DISK_IMG=build/disk/qedos-bios-rebuilt.img tools/ec2/boot-test.sh
 ```
 
+- `QEDOS_CONSOLE_UNTIL='<正規表現>'`: コンソールが一致したら 300 秒を待たずに片付けへ進む (例 `'M5-1 done|ENA\|ERROR|Failed assertion'`)
+
+### 2.6 EC2 用イメージ (`QEDOS_PROFILE=ec2-t3`, ENA)
+
+マシン別プロファイル (`sel4/meta_proofgate.py --profile`): `qemu` (既定、virtio-net 00:02.0) と `ec2-t3`
+(ENA 00:05.0、`sel4/drivers/ena/`)。sDDF の受信振り分けは宛先 MAC をビルド時に固定するため、ec2-t3 では
+固定の ENI を 1 つ作り、その MAC でビルドし、試験のたびにその ENI を付けて起動する。
+
+ENI の作成 (初回のみ、Mac で。ID と MAC は `build/ec2/eni.env` に置き、commit しない):
+
+```sh
+aws ec2 create-network-interface --subnet-id <boot-test.sh と同じサブネット> --description qedos-stage-e \
+  --tag-specifications 'ResourceType=network-interface,Tags=[{Key=Name,Value=qedos-stage-e-eni},{Key=project,Value=qedos-stage-e}]' \
+  --query 'NetworkInterface.[NetworkInterfaceId,MacAddress,PrivateIpAddress]' --output text --profile qedos
+# build/ec2/eni.env:
+#   QEDOS_EC2_ENI=eni-...
+#   QEDOS_NET_MAC=xx:xx:xx:xx:xx:xx
+```
+
+ビルド (VM) と起動試験 (Mac):
+
+```sh
+QEDOS_PROFILE=ec2-t3 QEDOS_NET_MAC=<MAC> scripts/build-sel4.sh      # 出力 build/sel4-x86_64_generic-ec2-t3/
+QEDOS_SEL4_DIR=build/sel4-x86_64_generic-ec2-t3 tools/mk-grub-disk.sh build/disk/qedos-bios-ec2.img
+# Mac
+set -a; . build/ec2/eni.env; set +a
+QEDOS_DISK_IMG=build/disk/qedos-bios-ec2.img tools/ec2/boot-test.sh
+```
+
+- `QEDOS_EC2_ENI` を指定すると `--network-interfaces DeviceIndex=0,NetworkInterfaceId=...` で起動する。ENI は片付けで消さない。
+  前のインスタンスが終了中で ENI が `in-use` のときは `available` になるまで待つ
+- 既存の ENI でも、既定のサブネットの自動割り当てによりパブリック IPv4 が付く (2026-10-20 に確認)。
+  既定のセキュリティグループの受信は VPC 内からの TCP 2049 のみなので、そのまま使う (本人判断)
+
 ## 3. 結果
 
 | Step | 内容 | 結果 (2026-10-20) |
@@ -130,6 +164,9 @@ QEDOS_DISK_IMG=build/disk/qedos-bios-rebuilt.img tools/ec2/boot-test.sh
 | M3-3 | EC2 t3.medium (1 回目) | `LEG_RT_CAP` の assert で停止 (レガシー経路なし) |
 | M3-4 | EC2 t3.medium (2 回目、IOAPIC pin 2 へ直接経路) | `timer0 cannot be routed to I/O APIC pin 2 (route cap 0xff0000)` で停止 |
 | M3-5 | EC2 t3.medium (3 回目、IOAPIC pin 23 へ直接経路) | **timer_driver 初期化成功**。tcp_pd が `listening on 0.0.0.0:8443` まで進み、`wrapped (1)..(3)` を観測 (約 68.7 秒ごと)。ethernet_driver は従来どおり停止 |
+| M4 | マシン別プロファイル (`--profile qemu｜ec2-t3`、`QEDOS_PROFILE`) | qemu: `proofgate.system` が変更前と同一 (乱数の MAC を除く)、SEL4_001..006 PASS |
+| M5-1 (1 回目) | ENA ドライバ (PCI 確認、リセット、管理キュー、GET_FEATURE)、固定 ENI で起動 | BAR0 が `0xfebf4000` (プロファイルの `0xc0400000` と違う) でドライバの確認により停止 |
+| M5-1 (2 回目) | BAR0 を `0xfebf4000` に修正 | **成功**。readless 読み出し、リセット、管理キュー (ポーリング) が動作し、MAC が ENI と一致 |
 
 M2 の上流ビルド済みイメージとの比較:
 
@@ -176,6 +213,17 @@ HPET (M3 のパッチが起動時に表示した値):
 | TSC | CPUID 0x15/0x16 から周波数が取れない (`Cannot detect or use TSC frequency`)。時刻の読み出しも HPET を使う (遅い) |
 | 割り込み | IOAPIC pin 23 (エッジ) で届く。NIC が無い状態で tcp_pd の lwIP の周期タイムアウトが回り続け、一周の検出が続いたことから判断 |
 
+ENA (M5-1 のドライバが表示した値、Legacy BIOS 起動):
+
+| 項目 | 値 |
+|---|---|
+| PCI | 00:05.0 `1d0f:ec20`、リビジョン 0 (readless 読み出しを使う)。BIOS 直後のコマンドレジスタ `0x103` (バスマスタ無効、ドライバが有効にする) |
+| BAR0 | **`0xfebf4000`** (Legacy BIOS / SeaBIOS)。4.2 の `0xc0400000` は UEFI で起動した AL2023 の値 |
+| レジスタ | dev_sts `0x1`、caps `0x3028` (DMA 幅 48 ビット、リセットのタイムアウト 2 秒、管理コマンドのタイムアウト指定なし) |
+| 版 | device 0.10、controller 0.0.1 (implementation 1) |
+| 属性 | MAC は ENI と一致、最大 MTU 9216、supported_features `0x14005986`、capabilities `0x1d` |
+| キューの上限 | 送受信それぞれ SQ/CQ 8 本、深さ 1024、送信ヘッダ最大 128、1 パケットの記述子 送信 17 / 受信 28 |
+
 ### 4.2 Amazon Linux 2023 での調査から (`collect-facts.sh`, 2026-10-20)
 
 | 項目 | 観測 |
@@ -187,7 +235,7 @@ HPET (M3 のパッチが起動時に表示した値):
 | チップセット | **i440FX + PIIX3/PIIX4** (QEMU の q35 とは別)。PCI 設定空間は conf1 (`0xcf8`) |
 | PCI | 00:03.0 VGA (1d0f:1111)、00:04.0 NVMe EBS (1d0f:8061)、00:05.0 **ENA (1d0f:ec20)** |
 | PCI MMIO 窓 | `0xc0000000-0xfebfffff` (64 ビット側は `0x140000000-`) |
-| ENA | BAR0 のみ `0xc0400000` 16KB (32 ビット, non-prefetchable、LLQ 用 BAR2 なし)。**MSI-X のみ** (9 ベクタ、テーブル BAR0+0x2000、PBA BAR0+0x3000)、INTx 無効 |
+| ENA | BAR0 のみ `0xc0400000` 16KB (32 ビット, non-prefetchable、LLQ 用 BAR2 なし。アドレスは UEFI 起動時の値で、Legacy BIOS では `0xfebf4000`、4.1)。**MSI-X のみ** (9 ベクタ、テーブル BAR0+0x2000、PBA BAR0+0x3000)、INTx 無効 |
 | RAM (Linux の e820) | `0x1000-0x9ffff`、`0x100000-0xbbccdfff`、`0xbbfde000-0xbff7bfff`、`0x100000000-0x13b3fffff` |
 | IOAPIC / シリアル | IOAPIC `0xfec00000` GSI 0-23。COM1 16550A `0x3f8` IRQ 4 |
 
@@ -199,10 +247,15 @@ HPET (M3 のパッチが起動時に表示した値):
 3. ~~**タイマー**~~ (済、3 章 M3): sDDF `tsc_hpet` を 32 ビット HPET と IOAPIC 直接経路に対応させた。
    TSC deadline タイマーは seL4 カーネルがスケジューリングに LAPIC タイマーとして使うため、ユーザーレベルのドライバでは使えない
    (`timer.c` のコメント)。上流 sDDF (2026-10-20 時点の main) に 32 ビット HPET の対応は無い
-4. **アドレスのプロファイル化**: `sel4/meta_proofgate.py` の QEMU 前提の値 (virtio BAR `0xFE000000`, DMA `0x7A000000`,
-   IOAPIC pin 11, COM1 `0x3F8`, PCI 0:2.0) をマシン別プロファイルへ。EC2 t3 の値は 4.2 から作る
-5. **ENA ドライバ (sDDF)**: 最大の作業。BAR0 のみ・MSI-X 必須。seL4/Microkit (sdfgen `IrqMsi`) で MSI を受け、
-   MSI-X テーブルを誰が設定するかを先に確認する。参考実装のライセンスは取り込み前に確認する
+4. ~~**アドレスのプロファイル化**~~ (済、2.6 と 3 章 M4): `--profile qemu｜ec2-t3`。HPET pin 23 と COM1 は共通、
+   ec2-t3 は ENA 00:05.0 / BAR0 `0xfebf4000` / DMA `0x7A000000` (64KB) / 固定 ENI の MAC
+5. **ENA ドライバ** (`sel4/drivers/ena/`、Amazon の ena_defs は BSD-3-Clause): 段階的に進める
+   - ~~M5-1~~ (済): PCI 確認、リセット、管理キュー (ポーリング)、属性の取得
+   - M5-2: 送受信のキュー各 1 本 (ホストメモリ配置)。割り込みの代わりにタイマーでポーリング。完了条件はコンソールの `DHCP lease acquired`
+   - M5-3: MSI-X。Microkit 2.3.1 は `<irq pcidev=... handle=... vector=...>` に対応するが、seL4 は MSI のアドレスとデータを
+     設定しないので、ドライバが MSI-X テーブルに書く (アドレス `0xFEE00000`、データは vector + 0x30。seL4 master のソースから。
+     2.3.1 の seL4 でも同じかは未確認)
+   - M5-4: HTTPS の疎通 (どこから接続するかはその時に決める)
 6. **IOMMU**: EC2 では使えない前提で、NIC を信頼境界に含めることを評価記録に明記する
 7. **UEFI 版ディスクイメージ**: UEFI のみのインスタンスタイプ向け。上流計画にある GRUB + UEFI の問題を QEMU (OVMF) で先に確認する
 8. **TSC の周波数**: EC2 では CPUID 0x15/0x16 から取れず、時刻の読み出しが HPET になる (性能の問題)。

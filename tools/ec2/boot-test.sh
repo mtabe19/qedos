@@ -2,7 +2,9 @@
 # Added in the mtabe19/qedos fork (Stage E, EC2 boot experiments).
 # One boot-test cycle on EC2, run from the developer's Mac (no helper instance):
 #   disk image -> EBS snapshot (coldsnap) -> AMI (legacy-bios) -> instance -> console log -> clean up.
-# The instance gets no public IP, no key pair and no inbound rules. Console output is read with
+# The instance gets no public IP, no key pair and no inbound rules. (With QEDOS_EC2_ENI the default
+# subnet's auto-assign setting still gives it a public IP; the default security group decides what can
+# reach it.) Console output is read with
 # `ec2 get-console-output --latest` and saved under build/ec2/.
 #
 # usage: tools/ec2/boot-test.sh [--keep] [--snapshot snap-xxxx]
@@ -15,7 +17,11 @@
 #   QEDOS_DISK_IMG         disk image (default build/disk/qedos-bios.img)
 #   QEDOS_EC2_TYPE         instance type (default t3.medium; the image needs RAM at 0x7A000000)
 #   QEDOS_EC2_SUBNET       subnet id (default: first default-for-az subnet)
+#   QEDOS_EC2_ENI          existing network interface to attach as the primary one (fixed MAC for
+#                          QEDOS_PROFILE=ec2-t3, see build/ec2/eni.env). It is not deleted on cleanup.
 #   QEDOS_CONSOLE_SECONDS  how long to collect console output after launch (default 300)
+#   QEDOS_CONSOLE_UNTIL    extended regex (grep -E): stop collecting as soon as the console matches it,
+#                          e.g. 'M5-1 done|ENA\|ERROR|Failed assertion' (default: wait QEDOS_CONSOLE_SECONDS)
 #   QEDOS_WAIT_TERMINATE   1: wait until the instance is terminated before deregistering the AMI
 #                          (default 0: QEDOS ignores ACPI shutdown, so termination takes ~4 min;
 #                          the root volume is DeleteOnTermination and goes away by itself)
@@ -32,6 +38,7 @@ export AWS_PAGER=""
 IMG="${QEDOS_DISK_IMG:-$R/build/disk/qedos-bios.img}"
 TYPE="${QEDOS_EC2_TYPE:-t3.medium}"
 CONSOLE_SECONDS="${QEDOS_CONSOLE_SECONDS:-300}"
+CONSOLE_UNTIL="${QEDOS_CONSOLE_UNTIL:-}"
 OMIT_ZERO="${QEDOS_OMIT_ZERO:-1}"
 WAIT_TERMINATE="${QEDOS_WAIT_TERMINATE:-0}"
 OUTDIR="$R/build/ec2"
@@ -119,7 +126,20 @@ fi
 
 trap on_exit EXIT
 trap 'exit 130' INT TERM
-log "run $NAME  type=$TYPE  subnet=$SUBNET  profile=$AWS_PROFILE  region=$AWS_REGION"
+
+ENI="${QEDOS_EC2_ENI:-}"
+if [ -n "$ENI" ]; then
+  ENI_STATUS=$(aws ec2 describe-network-interfaces --network-interface-ids "$ENI" \
+    --query 'NetworkInterfaces[0].Status' --output text)
+  if [ "$ENI_STATUS" != available ]; then
+    log "ENI $ENI is $ENI_STATUS; waiting until it is available (a previous instance may still be terminating)"
+    aws ec2 wait network-interface-available --network-interface-ids "$ENI"
+  fi
+  NET_OPTS="--network-interfaces DeviceIndex=0,NetworkInterfaceId=$ENI"
+else
+  NET_OPTS="--subnet-id $SUBNET --no-associate-public-ip-address"
+fi
+log "run $NAME  type=$TYPE  subnet=$SUBNET  eni=${ENI:-none}  profile=$AWS_PROFILE  region=$AWS_REGION"
 
 # ---- 1. snapshot (coldsnap uses the CLI's current short-term credentials)
 if [ -z "$SNAP" ]; then
@@ -160,7 +180,7 @@ aws ec2 wait image-available --image-ids "$AMI"
 
 # ---- 3. instance (no public IP, no key pair, default security group)
 IID=$(aws ec2 run-instances --image-id "$AMI" --instance-type "$TYPE" --count 1 \
-  --subnet-id "$SUBNET" --no-associate-public-ip-address \
+  $NET_OPTS \
   --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=project,Value=qedos-stage-e}]" \
   --query 'Instances[0].InstanceId' --output text)
 save_state
@@ -182,6 +202,10 @@ while [ "$(date +%s)" -lt "$end" ]; do
     if [ "$total" -gt "$shown" ]; then
       tail -n +"$((shown + 1))" "$CONSOLE"
       shown=$total
+    fi
+    if [ -n "$CONSOLE_UNTIL" ] && grep -Eq "$CONSOLE_UNTIL" "$CONSOLE"; then
+      log "console matched QEDOS_CONSOLE_UNTIL; stop collecting"
+      break
     fi
   fi
   sleep 15

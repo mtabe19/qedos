@@ -25,6 +25,11 @@ def main() -> None:
     parser.add_argument("--dtb", default=None, help="board DTB (required for aarch64 boards)")
     # mtabe19/qedos fork: I/O APIC pin of the HPET timer IRQ (x86); must match the timer driver's HPET_IOAPIC_PIN
     parser.add_argument("--hpet-ioapic-pin", type=int, default=2)
+    # mtabe19/qedos fork (Stage E): x86 machine profile. "qemu": virtio-net at PCI 00:02.0 (QEMU q35, default).
+    # "ec2-t3": ENA at PCI 00:05.0 on AWS EC2 t3 (docs/STAGE_E_EC2.md 4.2), polled by the timer until MSI-X.
+    parser.add_argument("--profile", default="qemu", choices=["qemu", "ec2-t3"])
+    # MAC address of tcp_pd's network client. ec2-t3 needs the MAC of the fixed ENI (VPC only delivers to it).
+    parser.add_argument("--mac", default=None)
     args = parser.parse_args()
 
     sys.path.append(os.path.join(args.sddf, "tools/meta"))
@@ -65,19 +70,36 @@ def main() -> None:
     if is_x86:
         serial_driver.add_ioport(SystemDescription.IoPort(0x3F8, 8, 0))
 
+    if is_x86 and args.profile == "ec2-t3":
+        if args.mac is None:
+            sys.exit("--mac (the fixed ENI's MAC address) is required for profile ec2-t3")
+        eth_elf = "eth_driver_ena.elf"
+    else:
+        eth_elf = "eth_driver.elf"
     ethernet_driver = ProtectionDomain(
-        "ethernet_driver", "eth_driver.elf", priority=101, budget=100, period=400, cpu=0
+        "ethernet_driver", eth_elf, priority=101, budget=100, period=400, cpu=0
     )
     if is_x86:
+        # Device DMA rings (no IOMMU: physical addresses are used directly). Within RAM on QEMU and EC2 t3.
         hw_net_rings = MemoryRegion(sdf, "hw_net_rings", 65536, paddr=0x7A000000)
         sdf.add_mr(hw_net_rings)
         ethernet_driver.add_map(Map(hw_net_rings, 0x7000_0000, "rw"))
 
-        virtio_net_regs = MemoryRegion(sdf, "virtio_net_regs", 0x4000, paddr=0xFE000000)
-        sdf.add_mr(virtio_net_regs)
-        ethernet_driver.add_map(Map(virtio_net_regs, 0x6000_0000, "rw", cached=False))
+        if args.profile == "qemu":
+            virtio_net_regs = MemoryRegion(sdf, "virtio_net_regs", 0x4000, paddr=0xFE000000)
+            sdf.add_mr(virtio_net_regs)
+            ethernet_driver.add_map(Map(virtio_net_regs, 0x6000_0000, "rw", cached=False))
 
-        ethernet_driver.add_irq(SystemDescription.IrqIoapic(ioapic_id=0, pin=11, vector=1, id=16))
+            ethernet_driver.add_irq(SystemDescription.IrqIoapic(ioapic_id=0, pin=11, vector=1, id=16))
+        else:
+            # ENA BAR0 (registers + MSI-X table at +0x2000), 16 KiB. 0xfebf4000 when EC2 t3 boots with
+            # legacy BIOS (SeaBIOS), as our AMIs do; Amazon Linux 2023 (UEFI) sees 0xc0400000 instead.
+            # The driver checks the BAR in PCI config space against this address.
+            ena_bar0 = MemoryRegion(sdf, "ena_bar0", 0x4000, paddr=0xFEBF4000)
+            sdf.add_mr(ena_bar0)
+            ethernet_driver.add_map(Map(ena_bar0, 0x6000_0000, "rw", cached=False))
+            # No IRQ yet: the driver polls on a periodic timeout (MSI-X later).
+            timer_system.add_client(ethernet_driver)
         ethernet_driver.add_ioport(SystemDescription.IoPort(0xCF8, 4, 1))
         ethernet_driver.add_ioport(SystemDescription.IoPort(0xCFC, 4, 2))
 
@@ -117,7 +139,7 @@ def main() -> None:
 
     serial_system.add_client(tcp_pd)
     timer_system.add_client(tcp_pd)
-    net_system.add_client_with_copier(tcp_pd, tcp_net_copier)
+    net_system.add_client_with_copier(tcp_pd, tcp_net_copier, mac_addr=args.mac)
     tcp_lwip = Sddf.Lwip(sdf, net_system, tcp_pd)
 
     assert serial_system.connect()
