@@ -147,8 +147,26 @@ QEDOS_DISK_IMG=build/disk/qedos-bios-ec2.img tools/ec2/boot-test.sh
 
 - `QEDOS_EC2_ENI` を指定すると `--network-interfaces DeviceIndex=0,NetworkInterfaceId=...` で起動する。ENI は片付けで消さない。
   前のインスタンスが終了中で ENI が `in-use` のときは `available` になるまで待つ
-- 既存の ENI でも、既定のサブネットの自動割り当てによりパブリック IPv4 が付く (2026-10-20 に確認)。
-  既定のセキュリティグループの受信は VPC 内からの TCP 2049 のみなので、そのまま使う (本人判断)
+- 既存の ENI でも、既定のサブネットの自動割り当てによりパブリック IPv4 が付く (2026-10-20 に確認)。そのまま使う (本人判断)
+
+HTTPS の確認 (M5-4):
+
+```sh
+# 初回のみ: 専用のセキュリティグループ (受信は TCP 8443 を自分のグローバル IP /32 からだけ) を作って ENI に付ける。
+# ID は build/ec2/eni.env に QEDOS_EC2_SG として置く。グローバル IP が変わったらルールを付け直す
+aws ec2 create-security-group --group-name qedos-stage-e-sg --vpc-id <既定の VPC> ...
+aws ec2 authorize-security-group-ingress --group-id <SG> --protocol tcp --port 8443 --cidr <自分の IP>/32
+aws ec2 modify-network-interface-attribute --network-interface-id <ENI> --groups <SG>
+
+# ターミナル 1
+QEDOS_CONSOLE_SECONDS=600 QEDOS_DISK_IMG=build/disk/qedos-bios-ec2.img tools/ec2/boot-test.sh 2>&1 | tee /tmp/boot.log
+# ターミナル 2 (instance running の 1 分後、DHCP の後)
+IP=$(sed -n 's/.*public IPv4: \([0-9.]*\).*/\1/p' /tmp/boot.log); tools/ec2/https-check.sh "$IP"
+```
+
+- `tools/ec2/https-check.sh IP [PORT]`: SEL4_001..003 と同じ確認 (TLS 1.3 + X25519MLKEM768 で GET /health -> 200、
+  TLS 1.2 と従来の鍵交換は拒否)。VM の QEMU に対しても `tools/ec2/https-check.sh 127.0.0.1 18443` で使える
+- `boot-test.sh` は running になったときにパブリック IPv4 を表示する。終わったら Ctrl-C で止めてよい (片付けは行われる)
 
 ## 3. 結果
 
@@ -170,6 +188,7 @@ QEDOS_DISK_IMG=build/disk/qedos-bios-ec2.img tools/ec2/boot-test.sh
 | M5-1 (2 回目) | BAR0 を `0xfebf4000` に修正 | **成功**。readless 読み出し、リセット、管理キュー (ポーリング) が動作し、MAC が ENI と一致 |
 | M5-2 | 送受信キュー各 1 本 (深さ 256、ホストメモリ配置)、1ms ごとのポーリング、ホスト情報と MTU 1500 の設定 | **成功**。`TCP_PD: DHCP lease acquired` (IP は ENI のプライベート IP と一致)。送信 350B x2 / 受信 590B x2 (DHCP)、送信 42B x4 (ARP と推測)、エラー 0 |
 | M5-3 | MSI-X (入口 0/1/2 を同じ vector 106 へ、送信 CQ 1・受信 CQ 2)、ポーリングは 100ms の予備のみ | **成功**。DHCP 取得後、割り込み 12 回 / 予備ポーリングで見つかった完了 0。途中で届いた ARP (と推測) にも応答 |
+| M5-4 | 手元の Mac からパブリック IPv4 の 8443 へ `tools/ec2/https-check.sh` | **成功**。TLS 1.3 + X25519MLKEM768 + AES-256-GCM で GET /health -> 200 (1 秒未満)、TLS 1.2 と X25519 / P-256 単独は拒否。コンソールにも `TLS_PD: handshake OK ... X25519MLKEM768` と `handshake rejected (LAW_002/LAW_003)` x3。割り込み 55 回 / 予備ポーリング 0。backend への転送は未確認 (転送先が QEMU 用の 10.0.2.2) |
 
 M2 の上流ビルド済みイメージとの比較:
 
@@ -261,7 +280,8 @@ ENA (M5-1 のドライバが表示した値、Legacy BIOS 起動):
    - ~~M5-3~~ (済): MSI-X。Microkit は MSI を 1 つの PCI デバイスにつき 1 つしか持てない (`sdf.rs` の重複チェック) ため、
      ENA の入口 0/1/2 に同じアドレスとデータを書いて 1 つの IRQ で受ける。seL4 は MSI のアドレスとデータを設定しないので
      ドライバが書く (アドレス `0xFEE00000`、データは vector + 0x30。Microkit 2.3.1 の実機で確認)。100ms の予備ポーリングは残す
-   - M5-4: HTTPS の疎通 (どこから接続するかはその時に決める)
+   - ~~M5-4~~ (済): HTTPS の疎通。専用のセキュリティグループで自分の IP からだけ 8443 を許可し、`https-check.sh` で確認
+   - 次: backend への転送 (EC2 から届く転送先と、それを指す署名済み設定)、性能 (TSC の周波数、項目 8)
 6. **IOMMU**: EC2 では使えない前提で、NIC を信頼境界に含めることを評価記録に明記する
 7. **UEFI 版ディスクイメージ**: UEFI のみのインスタンスタイプ向け。上流計画にある GRUB + UEFI の問題を QEMU (OVMF) で先に確認する
 8. **TSC の周波数**: EC2 では CPUID 0x15/0x16 から取れず、時刻の読み出しが HPET になる (性能の問題)。

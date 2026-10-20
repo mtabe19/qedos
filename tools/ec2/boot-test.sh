@@ -186,6 +186,9 @@ IID=$(aws ec2 run-instances --image-id "$AMI" --instance-type "$TYPE" --count 1 
 save_state
 log "instance $IID ($TYPE) launched"
 aws ec2 wait instance-running --instance-ids "$IID"
+PUBIP=$(aws ec2 describe-instances --instance-ids "$IID" \
+  --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+log "public IPv4: $PUBIP (run tools/ec2/https-check.sh $PUBIP after 'DHCP lease acquired')"
 log "instance running; collecting console output for ${CONSOLE_SECONDS}s -> $OUTDIR/console-$STAMP.log"
 
 # ---- 4. console output (refreshed by EC2 about once a minute)
