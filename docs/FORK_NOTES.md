@@ -45,4 +45,5 @@ GitHub の「Sync fork」ボタンでも main は更新できる。
 ## 関連
 
 - Stage E (EC2) の記録: `docs/STAGE_E_EC2.md`
+- ALB の代わりにする検討 (M6 以降の方針と PLAN): `docs/ALB_REPLACEMENT.md`
 - 上流の bare-metal 計画: `docs/X86_BAREMETAL_PLAN.md`
