@@ -115,7 +115,8 @@ scp mtabe@<vm>:qedos/build/disk/qedos-bios-rebuilt.img build/disk/
 QEDOS_DISK_IMG=build/disk/qedos-bios-rebuilt.img tools/ec2/boot-test.sh
 ```
 
-- `QEDOS_CONSOLE_UNTIL='<正規表現>'`: コンソールが一致したら 300 秒を待たずに片付けへ進む (例 `'M5-1 done|ENA\|ERROR|Failed assertion'`)
+- `QEDOS_CONSOLE_UNTIL='<正規表現>'`: コンソールが一致したら 300 秒を待たずに片付けへ進む
+  (例 `'DHCP lease|ENA\|ERROR|Failed assertion'`)。M5-2 では running から約 35 秒で一致し、1 回の試験が約 1 分で終わった
 
 ### 2.6 EC2 用イメージ (`QEDOS_PROFILE=ec2-t3`, ENA)
 
@@ -167,6 +168,7 @@ QEDOS_DISK_IMG=build/disk/qedos-bios-ec2.img tools/ec2/boot-test.sh
 | M4 | マシン別プロファイル (`--profile qemu｜ec2-t3`、`QEDOS_PROFILE`) | qemu: `proofgate.system` が変更前と同一 (乱数の MAC を除く)、SEL4_001..006 PASS |
 | M5-1 (1 回目) | ENA ドライバ (PCI 確認、リセット、管理キュー、GET_FEATURE)、固定 ENI で起動 | BAR0 が `0xfebf4000` (プロファイルの `0xc0400000` と違う) でドライバの確認により停止 |
 | M5-1 (2 回目) | BAR0 を `0xfebf4000` に修正 | **成功**。readless 読み出し、リセット、管理キュー (ポーリング) が動作し、MAC が ENI と一致 |
+| M5-2 | 送受信キュー各 1 本 (深さ 256、ホストメモリ配置)、1ms ごとのポーリング、ホスト情報と MTU 1500 の設定 | **成功**。`TCP_PD: DHCP lease acquired` (IP は ENI のプライベート IP と一致)。送信 350B x2 / 受信 590B x2 (DHCP)、送信 42B x4 (ARP と推測)、エラー 0 |
 
 M2 の上流ビルド済みイメージとの比較:
 
@@ -223,6 +225,8 @@ ENA (M5-1 のドライバが表示した値、Legacy BIOS 起動):
 | 版 | device 0.10、controller 0.0.1 (implementation 1) |
 | 属性 | MAC は ENI と一致、最大 MTU 9216、supported_features `0x14005986`、capabilities `0x1d` |
 | キューの上限 | 送受信それぞれ SQ/CQ 8 本、深さ 1024、送信ヘッダ最大 128、1 パケットの記述子 送信 17 / 受信 28 |
+| I/O キュー (M5-2) | 送信 sq 0 / cq 0 (SQ ドアベル BAR0+0x100)、受信 sq 0 / cq 1 (SQ ドアベル BAR0+0x300)。ホスト情報 (HOST_ATTR_CONFIG) と MTU の SET_FEATURE は成功 |
+| AENQ | M5-2 の試験中の通知は 0 件 (通知グループを SET_FEATURE AENQ_CONFIG で設定していないためと推測) |
 
 ### 4.2 Amazon Linux 2023 での調査から (`collect-facts.sh`, 2026-10-20)
 
@@ -251,7 +255,7 @@ ENA (M5-1 のドライバが表示した値、Legacy BIOS 起動):
    ec2-t3 は ENA 00:05.0 / BAR0 `0xfebf4000` / DMA `0x7A000000` (64KB) / 固定 ENI の MAC
 5. **ENA ドライバ** (`sel4/drivers/ena/`、Amazon の ena_defs は BSD-3-Clause): 段階的に進める
    - ~~M5-1~~ (済): PCI 確認、リセット、管理キュー (ポーリング)、属性の取得
-   - M5-2: 送受信のキュー各 1 本 (ホストメモリ配置)。割り込みの代わりにタイマーでポーリング。完了条件はコンソールの `DHCP lease acquired`
+   - ~~M5-2~~ (済): 送受信のキュー各 1 本 (ホストメモリ配置)、タイマーで 1ms ごとにポーリング。VPC の DHCP からアドレスを取得
    - M5-3: MSI-X。Microkit 2.3.1 は `<irq pcidev=... handle=... vector=...>` に対応するが、seL4 は MSI のアドレスとデータを
      設定しないので、ドライバが MSI-X テーブルに書く (アドレス `0xFEE00000`、データは vector + 0x30。seL4 master のソースから。
      2.3.1 の seL4 でも同じかは未確認)

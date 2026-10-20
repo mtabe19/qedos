@@ -5,7 +5,10 @@
  * mtabe19/qedos fork, Stage E (docs/STAGE_E_EC2.md 5-5).
  *
  * Step M5-1: find the ENA on PCI, reset it, bring up the admin queue in polling mode and print the
- * device attributes (MAC address, MTU, queue limits). No I/O queues and no interrupts yet.
+ * device attributes (MAC address, MTU, queue limits).
+ * Step M5-2: one TX and one RX queue (descriptors in host memory, one descriptor per packet), connected
+ * to the sDDF net virtualisers. No interrupts yet: completions and the AENQ are polled on a periodic
+ * timeout (POLL_INTERVAL_NS).
  *
  * Register layout and admin command formats come from ena_defs/ (Amazon, BSD-3-Clause, see
  * ena_defs/README.md). The init sequence follows ena_com.c of the same source: ena_com_dev_reset(),
@@ -72,7 +75,22 @@ __attribute__((__section__(".timer_client_config"))) timer_client_config_t timer
 #define DMA_OFF_ACQ 0x0800     /* 32 * 64 B */
 #define DMA_OFF_AENQ 0x1000    /* 16 * 64 B */
 #define DMA_OFF_MMIO_RESP 0x1400
-/* 0x2000..: I/O queues (M5-2) */
+#define DMA_OFF_HOST_INFO 0x2000 /* struct ena_admin_host_info */
+#define DMA_OFF_TX_SQ 0x3000     /* IO_QUEUE_DEPTH * 16 B */
+#define DMA_OFF_TX_CQ 0x4000     /* IO_QUEUE_DEPTH * 8 B */
+#define DMA_OFF_RX_SQ 0x5000     /* IO_QUEUE_DEPTH * 16 B */
+#define DMA_OFF_RX_CQ 0x6000     /* IO_QUEUE_DEPTH * 16 B */
+
+/* ---- I/O queues (M5-2) ---- */
+#define IO_QUEUE_DEPTH 256 /* power of two, device limit 1024 */
+#define ENA_MTU 1500       /* sDDF buffers are NET_BUFFER_SIZE (2048) bytes */
+#define POLL_INTERVAL_NS (1ULL * NS_IN_MS)
+#define STATS_INTERVAL_NS (5ULL * NS_IN_S)
+#define TRACE_FRAMES 6 /* print the first frames in each direction */
+/* ena_admin_host_info.os_type: there is no value for seL4; use the one of the FreeBSD driver this one
+ * follows (ENA_ADMIN_OS_FREEBSD in ena_plat.h of the reference) */
+#define QEDOS_ENA_OS_TYPE 4
+#define QEDOS_ENA_DRIVER_VERSION 0x000201 /* 1.2.0 (major | minor << 8 | sub_minor << 16) */
 
 #define MMIO_READ_TIMEOUT_NS (10ULL * NS_IN_MS)
 #define REG_READ_FAILED 0xFFFFFFFFu
@@ -87,6 +105,16 @@ _Static_assert(sizeof(struct ena_admin_aenq_entry) == 64, "AENQ entry must be 64
 _Static_assert(ENA_ADMIN_QUEUE_DEPTH * 64 <= DMA_OFF_ACQ - DMA_OFF_AQ, "AQ does not fit");
 _Static_assert(ENA_ADMIN_QUEUE_DEPTH * 64 <= DMA_OFF_AENQ - DMA_OFF_ACQ, "ACQ does not fit");
 _Static_assert(ENA_ASYNC_QUEUE_DEPTH * 64 <= DMA_OFF_MMIO_RESP - DMA_OFF_AENQ, "AENQ does not fit");
+_Static_assert(sizeof(struct ena_admin_host_info) <= DMA_OFF_TX_SQ - DMA_OFF_HOST_INFO, "host info does not fit");
+_Static_assert(sizeof(struct ena_eth_io_tx_desc) == 16, "TX descriptor size");
+_Static_assert(sizeof(struct ena_eth_io_tx_cdesc) == 8, "TX completion size");
+_Static_assert(sizeof(struct ena_eth_io_rx_desc) == 16, "RX descriptor size");
+_Static_assert(sizeof(struct ena_eth_io_rx_cdesc_base) == 16, "RX completion size");
+_Static_assert(IO_QUEUE_DEPTH * 16 <= DMA_OFF_TX_CQ - DMA_OFF_TX_SQ, "TX SQ does not fit");
+_Static_assert(IO_QUEUE_DEPTH * 8 <= DMA_OFF_RX_SQ - DMA_OFF_TX_CQ, "TX CQ does not fit");
+_Static_assert(IO_QUEUE_DEPTH * 16 <= DMA_OFF_RX_CQ - DMA_OFF_RX_SQ, "RX SQ does not fit");
+_Static_assert(DMA_OFF_RX_CQ + IO_QUEUE_DEPTH * 16 <= ENA_DMA_SIZE, "RX CQ does not fit");
+_Static_assert((IO_QUEUE_DEPTH & (IO_QUEUE_DEPTH - 1)) == 0, "queue depth must be a power of two");
 
 static volatile uint8_t *const bar0 = (volatile uint8_t *)ENA_BAR0_VADDR;
 
@@ -107,7 +135,43 @@ static struct {
     uint32_t supported_features;
     uint8_t mac[6];
     bool ready;
+
+    uint16_t aenq_head;
+    uint8_t aenq_phase;
 } ena;
+
+/* One I/O queue pair (SQ + CQ). req_id identifies the sDDF buffer of a descriptor; free req_ids are
+ * kept on a stack because completions need not come back in order. */
+typedef struct io_queue {
+    volatile void *sq;
+    volatile void *cq;
+    volatile uint32_t *db;
+    uint16_t sq_idx;
+    uint16_t cq_idx;
+    uint16_t sq_tail;
+    uint8_t sq_phase;
+    uint16_t cq_head;
+    uint8_t cq_phase;
+    uint16_t inflight;
+    net_buff_desc_t buf[IO_QUEUE_DEPTH];
+    uint16_t free_ids[IO_QUEUE_DEPTH];
+    uint16_t num_free_ids;
+} io_queue_t;
+
+static io_queue_t txq;
+static io_queue_t rxq;
+net_queue_handle_t rx_queue;
+net_queue_handle_t tx_queue;
+
+static struct {
+    uint64_t rx_pkts;
+    uint64_t tx_pkts;
+    uint64_t rx_bytes;
+    uint64_t tx_bytes;
+    uint64_t rx_errs;
+    uint64_t aenq_events;
+    uint64_t next_print_ns;
+} stats;
 
 static inline uintptr_t dma_paddr(uintptr_t off)
 {
@@ -435,9 +499,409 @@ static bool read_device_info(void)
     return true;
 }
 
+/* ---- M5-2: host info, MTU, I/O queues and the polled data path ---- */
+
+static void set_mem_addr(struct ena_common_mem_addr *a, uint64_t paddr)
+{
+    a->mem_addr_low = (uint32_t)paddr;
+    a->mem_addr_high = (uint16_t)(paddr >> 32);
+}
+
+static int set_feature(enum ena_admin_aq_feature_id id, struct ena_admin_set_feat_cmd *cmd)
+{
+    struct ena_admin_set_feat_resp resp;
+    if (!(ena.supported_features & BIT(id))) {
+        LOG_ENA_ERR("feature %u is not supported by the device\n", id);
+        return -1;
+    }
+    cmd->aq_common_descriptor.opcode = ENA_ADMIN_SET_FEATURE;
+    cmd->feat_common.feature_id = id;
+    _Static_assert(sizeof(*cmd) == sizeof(struct ena_admin_aq_entry), "set feature command size");
+    _Static_assert(sizeof(resp) == sizeof(struct ena_admin_acq_entry), "set feature response size");
+    return admin_exec((struct ena_admin_aq_entry *)cmd, (struct ena_admin_acq_entry *)&resp);
+}
+
+static void copy_str(volatile uint8_t *dst, const char *src, size_t size)
+{
+    size_t i = 0;
+    for (; i + 1 < size && src[i]; i++) {
+        dst[i] = src[i];
+    }
+    dst[i] = 0;
+}
+
+static bool set_host_info(void)
+{
+    volatile struct ena_admin_host_info *hi = dma_vaddr(DMA_OFF_HOST_INFO);
+    memset((void *)hi, 0, sizeof(*hi));
+    hi->os_type = QEDOS_ENA_OS_TYPE;
+    copy_str(hi->os_dist_str, "QEDOS (seL4 Microkit 2.3.1)", sizeof(hi->os_dist_str));
+    copy_str(hi->kernel_ver_str, "seL4", sizeof(hi->kernel_ver_str));
+    hi->driver_version = QEDOS_ENA_DRIVER_VERSION;
+    hi->ena_spec_version = (ENA_COMMON_SPEC_VERSION_MAJOR << 8) | ENA_COMMON_SPEC_VERSION_MINOR;
+    hi->bdf = (ENA_PCI_BUS << 8) | (ENA_PCI_DEV << 3) | ENA_PCI_FUNC;
+    hi->num_cpus = 1;
+    /* no rx_offset: received data always starts at the beginning of the buffer */
+    hi->driver_supported_features = 0;
+
+    struct ena_admin_set_feat_cmd cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    set_mem_addr(&cmd.u.host_attr.os_info_ba, dma_paddr(DMA_OFF_HOST_INFO));
+    return set_feature(ENA_ADMIN_HOST_ATTR_CONFIG, &cmd) == 0;
+}
+
+static bool set_mtu(uint32_t mtu)
+{
+    struct ena_admin_set_feat_cmd cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.u.mtu.mtu = mtu;
+    return set_feature(ENA_ADMIN_MTU, &cmd) == 0;
+}
+
+static bool create_queue(io_queue_t *q, bool tx, uintptr_t sq_off, uintptr_t cq_off)
+{
+    uint16_t cdesc_size = tx ? sizeof(struct ena_eth_io_tx_cdesc) : sizeof(struct ena_eth_io_rx_cdesc_base);
+    q->sq = dma_vaddr(sq_off);
+    q->cq = dma_vaddr(cq_off);
+    memset(dma_vaddr(sq_off), 0, IO_QUEUE_DEPTH * 16);
+    memset(dma_vaddr(cq_off), 0, IO_QUEUE_DEPTH * cdesc_size);
+    q->sq_tail = 0;
+    q->sq_phase = 1;
+    q->cq_head = 0;
+    q->cq_phase = 1;
+    q->inflight = 0;
+    q->num_free_ids = IO_QUEUE_DEPTH;
+    for (uint16_t i = 0; i < IO_QUEUE_DEPTH; i++) {
+        q->free_ids[i] = IO_QUEUE_DEPTH - 1 - i;
+    }
+
+    /* completion queue first, without interrupts (polling) */
+    struct ena_admin_aq_create_cq_cmd ccmd;
+    struct ena_admin_acq_create_cq_resp_desc cresp;
+    memset(&ccmd, 0, sizeof(ccmd));
+    ccmd.aq_common_descriptor.opcode = ENA_ADMIN_CREATE_CQ;
+    ccmd.cq_caps_2 = (cdesc_size / 4) & ENA_ADMIN_AQ_CREATE_CQ_CMD_CQ_ENTRY_SIZE_WORDS_MASK;
+    ccmd.cq_depth = IO_QUEUE_DEPTH;
+    set_mem_addr(&ccmd.cq_ba, dma_paddr(cq_off));
+    _Static_assert(sizeof(ccmd) <= sizeof(struct ena_admin_aq_entry), "create cq command size");
+    _Static_assert(sizeof(cresp) <= sizeof(struct ena_admin_acq_entry), "create cq response size");
+    struct ena_admin_aq_entry cmd_entry;
+    struct ena_admin_acq_entry comp_entry;
+    memset(&cmd_entry, 0, sizeof(cmd_entry));
+    memcpy(&cmd_entry, &ccmd, sizeof(ccmd));
+    if (admin_exec(&cmd_entry, &comp_entry)) {
+        return false;
+    }
+    memcpy(&cresp, &comp_entry, sizeof(cresp));
+    q->cq_idx = cresp.cq_idx;
+    if (cresp.cq_actual_depth != IO_QUEUE_DEPTH) {
+        LOG_ENA_ERR("%s CQ depth %u, requested %u\n", tx ? "TX" : "RX", cresp.cq_actual_depth, IO_QUEUE_DEPTH);
+        return false;
+    }
+
+    /* submission queue, descriptors in host memory */
+    struct ena_admin_aq_create_sq_cmd scmd;
+    struct ena_admin_acq_create_sq_resp_desc sresp;
+    memset(&scmd, 0, sizeof(scmd));
+    scmd.aq_common_descriptor.opcode = ENA_ADMIN_CREATE_SQ;
+    scmd.sq_identity = ((tx ? ENA_ADMIN_SQ_DIRECTION_TX : ENA_ADMIN_SQ_DIRECTION_RX)
+                        << ENA_ADMIN_AQ_CREATE_SQ_CMD_SQ_DIRECTION_SHIFT)
+                     & ENA_ADMIN_AQ_CREATE_SQ_CMD_SQ_DIRECTION_MASK;
+    scmd.sq_caps_2 = (ENA_ADMIN_PLACEMENT_POLICY_HOST & ENA_ADMIN_AQ_CREATE_SQ_CMD_PLACEMENT_POLICY_MASK)
+                   | ((ENA_ADMIN_COMPLETION_POLICY_DESC << ENA_ADMIN_AQ_CREATE_SQ_CMD_COMPLETION_POLICY_SHIFT)
+                      & ENA_ADMIN_AQ_CREATE_SQ_CMD_COMPLETION_POLICY_MASK);
+    scmd.sq_caps_3 = ENA_ADMIN_AQ_CREATE_SQ_CMD_IS_PHYSICALLY_CONTIGUOUS_MASK;
+    scmd.cq_idx = q->cq_idx;
+    scmd.sq_depth = IO_QUEUE_DEPTH;
+    set_mem_addr(&scmd.sq_ba, dma_paddr(sq_off));
+    _Static_assert(sizeof(scmd) <= sizeof(struct ena_admin_aq_entry), "create sq command size");
+    _Static_assert(sizeof(sresp) <= sizeof(struct ena_admin_acq_entry), "create sq response size");
+    memset(&cmd_entry, 0, sizeof(cmd_entry));
+    memcpy(&cmd_entry, &scmd, sizeof(scmd));
+    if (admin_exec(&cmd_entry, &comp_entry)) {
+        return false;
+    }
+    memcpy(&sresp, &comp_entry, sizeof(sresp));
+    q->sq_idx = sresp.sq_idx;
+    if (sresp.sq_doorbell_offset == 0 || sresp.sq_doorbell_offset + 4 > 0x4000) {
+        LOG_ENA_ERR("%s SQ doorbell offset 0x%x is outside BAR0\n", tx ? "TX" : "RX", sresp.sq_doorbell_offset);
+        return false;
+    }
+    q->db = (volatile uint32_t *)(bar0 + sresp.sq_doorbell_offset);
+    LOG_ENA("%s queue: sq %u (doorbell 0x%x), cq %u, depth %u\n", tx ? "TX" : "RX", q->sq_idx,
+            sresp.sq_doorbell_offset, q->cq_idx, IO_QUEUE_DEPTH);
+    return true;
+}
+
+static inline void sq_doorbell(io_queue_t *q)
+{
+    THREAD_MEMORY_FENCE();
+    *q->db = q->sq_tail;
+}
+
+static inline void sq_advance(io_queue_t *q)
+{
+    q->sq_tail++;
+    if ((q->sq_tail & (IO_QUEUE_DEPTH - 1)) == 0) {
+        q->sq_phase = !q->sq_phase;
+    }
+    q->inflight++;
+}
+
+static inline void cq_advance(io_queue_t *q)
+{
+    q->cq_head++;
+    if ((q->cq_head & (IO_QUEUE_DEPTH - 1)) == 0) {
+        q->cq_phase = !q->cq_phase;
+    }
+}
+
+static void trace_frame(const char *dir, uint64_t n, uint64_t paddr, uint16_t len)
+{
+    if (n > TRACE_FRAMES) {
+        return;
+    }
+    /* sDDF data regions are mapped into this PD only by io address; print the length only */
+    LOG_ENA("%s frame #%lu: %u bytes at 0x%lx\n", dir, n, len, paddr);
+}
+
+static void rx_provide(void)
+{
+    bool posted = false;
+    bool reprocess = true;
+    while (reprocess) {
+        /* keep one slot empty so a full ring is not confused with an empty one */
+        while (rxq.inflight < IO_QUEUE_DEPTH - 1 && !net_queue_empty_free(&rx_queue)) {
+            net_buff_desc_t buffer;
+            int err = net_dequeue_free(&rx_queue, &buffer);
+            assert(!err);
+            uint16_t req_id = rxq.free_ids[--rxq.num_free_ids];
+            rxq.buf[req_id] = buffer;
+
+            volatile struct ena_eth_io_rx_desc *d =
+                &((volatile struct ena_eth_io_rx_desc *)rxq.sq)[rxq.sq_tail & (IO_QUEUE_DEPTH - 1)];
+            d->length = NET_BUFFER_SIZE;
+            d->reserved2 = 0;
+            d->req_id = req_id;
+            d->reserved6 = 0;
+            d->buff_addr_lo = (uint32_t)buffer.io_or_offset;
+            d->buff_addr_hi = (uint16_t)(buffer.io_or_offset >> 32);
+            d->reserved16_w3 = 0;
+            THREAD_MEMORY_RELEASE();
+            /* the phase bit last, so the device never sees a half-written descriptor */
+            d->ctrl = ENA_ETH_IO_RX_DESC_FIRST_MASK | ENA_ETH_IO_RX_DESC_LAST_MASK | ENA_ETH_IO_RX_DESC_COMP_REQ_MASK
+                    | (rxq.sq_phase & ENA_ETH_IO_RX_DESC_PHASE_MASK);
+            sq_advance(&rxq);
+            posted = true;
+        }
+        net_request_signal_free(&rx_queue);
+        reprocess = false;
+        if (rxq.inflight < IO_QUEUE_DEPTH - 1 && !net_queue_empty_free(&rx_queue)) {
+            net_cancel_signal_free(&rx_queue);
+            reprocess = true;
+        }
+    }
+    if (posted) {
+        sq_doorbell(&rxq);
+    }
+}
+
+static void rx_return(void)
+{
+    bool transferred = false;
+    for (;;) {
+        volatile struct ena_eth_io_rx_cdesc_base *c =
+            &((volatile struct ena_eth_io_rx_cdesc_base *)rxq.cq)[rxq.cq_head & (IO_QUEUE_DEPTH - 1)];
+        uint32_t status = c->status;
+        if (((status & ENA_ETH_IO_RX_CDESC_BASE_PHASE_MASK) >> ENA_ETH_IO_RX_CDESC_BASE_PHASE_SHIFT) != rxq.cq_phase) {
+            break;
+        }
+        THREAD_MEMORY_ACQUIRE();
+        uint16_t req_id = c->req_id;
+        uint16_t len = c->length;
+        cq_advance(&rxq);
+        if (req_id >= IO_QUEUE_DEPTH) {
+            LOG_ENA_ERR("RX completion with invalid req_id %u\n", req_id);
+            stats.rx_errs++;
+            continue;
+        }
+        net_buff_desc_t buffer = rxq.buf[req_id];
+        rxq.free_ids[rxq.num_free_ids++] = req_id;
+        rxq.inflight--;
+
+        bool single = (status & ENA_ETH_IO_RX_CDESC_BASE_FIRST_MASK) && (status & ENA_ETH_IO_RX_CDESC_BASE_LAST_MASK);
+        if (!single || len == 0 || len > NET_BUFFER_SIZE) {
+            /* multi-descriptor frame (larger than one buffer) or bad length: drop it */
+            stats.rx_errs++;
+            buffer.len = 0;
+            int err = net_enqueue_free(&rx_queue, buffer);
+            assert(!err);
+            continue;
+        }
+        stats.rx_pkts++;
+        stats.rx_bytes += len;
+        trace_frame("RX", stats.rx_pkts, buffer.io_or_offset, len);
+        buffer.len = len;
+        int err = net_enqueue_active(&rx_queue, buffer);
+        assert(!err);
+        transferred = true;
+    }
+    if (transferred && net_require_signal_active(&rx_queue)) {
+        net_cancel_signal_active(&rx_queue);
+        sddf_notify(config.virt_rx.id);
+    }
+}
+
+static void tx_provide(void)
+{
+    bool posted = false;
+    bool reprocess = true;
+    while (reprocess) {
+        while (txq.inflight < IO_QUEUE_DEPTH - 1 && !net_queue_empty_active(&tx_queue)) {
+            net_buff_desc_t buffer;
+            int err = net_dequeue_active(&tx_queue, &buffer);
+            assert(!err);
+            uint16_t req_id = txq.free_ids[--txq.num_free_ids];
+            txq.buf[req_id] = buffer;
+
+            volatile struct ena_eth_io_tx_desc *d =
+                &((volatile struct ena_eth_io_tx_desc *)txq.sq)[txq.sq_tail & (IO_QUEUE_DEPTH - 1)];
+            d->meta_ctrl = ((uint32_t)req_id << ENA_ETH_IO_TX_DESC_REQ_ID_LO_SHIFT) & ENA_ETH_IO_TX_DESC_REQ_ID_LO_MASK;
+            d->buff_addr_lo = (uint32_t)buffer.io_or_offset;
+            /* header length 0: descriptors are in host memory (the reference driver does the same) */
+            d->buff_addr_hi_hdr_sz = (uint32_t)(buffer.io_or_offset >> 32) & ENA_ETH_IO_TX_DESC_ADDR_HI_MASK;
+            THREAD_MEMORY_RELEASE();
+            /* len_ctrl carries the phase bit, so it is written last */
+            d->len_ctrl = (buffer.len & ENA_ETH_IO_TX_DESC_LENGTH_MASK)
+                        | ((((uint32_t)req_id >> 10) << ENA_ETH_IO_TX_DESC_REQ_ID_HI_SHIFT) & ENA_ETH_IO_TX_DESC_REQ_ID_HI_MASK)
+                        | (((uint32_t)txq.sq_phase << ENA_ETH_IO_TX_DESC_PHASE_SHIFT) & ENA_ETH_IO_TX_DESC_PHASE_MASK)
+                        | ENA_ETH_IO_TX_DESC_FIRST_MASK | ENA_ETH_IO_TX_DESC_LAST_MASK | ENA_ETH_IO_TX_DESC_COMP_REQ_MASK;
+            sq_advance(&txq);
+            stats.tx_pkts++;
+            stats.tx_bytes += buffer.len;
+            trace_frame("TX", stats.tx_pkts, buffer.io_or_offset, buffer.len);
+            posted = true;
+        }
+        net_request_signal_active(&tx_queue);
+        reprocess = false;
+        if (txq.inflight < IO_QUEUE_DEPTH - 1 && !net_queue_empty_active(&tx_queue)) {
+            net_cancel_signal_active(&tx_queue);
+            reprocess = true;
+        }
+    }
+    if (posted) {
+        sq_doorbell(&txq);
+    }
+}
+
+static void tx_return(void)
+{
+    bool transferred = false;
+    for (;;) {
+        volatile struct ena_eth_io_tx_cdesc *c =
+            &((volatile struct ena_eth_io_tx_cdesc *)txq.cq)[txq.cq_head & (IO_QUEUE_DEPTH - 1)];
+        if ((c->flags & ENA_ETH_IO_TX_CDESC_PHASE_MASK) != txq.cq_phase) {
+            break;
+        }
+        THREAD_MEMORY_ACQUIRE();
+        uint16_t req_id = c->req_id;
+        cq_advance(&txq);
+        if (req_id >= IO_QUEUE_DEPTH) {
+            LOG_ENA_ERR("TX completion with invalid req_id %u\n", req_id);
+            continue;
+        }
+        net_buff_desc_t buffer = txq.buf[req_id];
+        txq.free_ids[txq.num_free_ids++] = req_id;
+        txq.inflight--;
+        buffer.len = 0;
+        int err = net_enqueue_free(&tx_queue, buffer);
+        assert(!err);
+        transferred = true;
+    }
+    if (transferred && net_require_signal_free(&tx_queue)) {
+        net_cancel_signal_free(&tx_queue);
+        sddf_notify(config.virt_tx.id);
+    }
+}
+
+/* Asynchronous event notifications (keep-alive, link change, ...): consume them so the queue does not
+ * fill up, and print the first few. */
+static void aenq_poll(void)
+{
+    volatile struct ena_admin_aenq_entry *q = dma_vaddr(DMA_OFF_AENQ);
+    uint16_t processed = 0;
+    for (;;) {
+        volatile struct ena_admin_aenq_entry *e = &q[ena.aenq_head & (ENA_ASYNC_QUEUE_DEPTH - 1)];
+        if ((e->aenq_common_desc.flags & ENA_ADMIN_AENQ_COMMON_DESC_PHASE_MASK) != ena.aenq_phase) {
+            break;
+        }
+        THREAD_MEMORY_ACQUIRE();
+        stats.aenq_events++;
+        if (stats.aenq_events <= 4) {
+            LOG_ENA("AENQ event #%lu: group %u, syndrome %u\n", stats.aenq_events, e->aenq_common_desc.group,
+                    e->aenq_common_desc.syndrome);
+        }
+        ena.aenq_head++;
+        processed++;
+        if ((ena.aenq_head & (ENA_ASYNC_QUEUE_DEPTH - 1)) == 0) {
+            ena.aenq_phase = !ena.aenq_phase;
+        }
+    }
+    if (processed) {
+        reg_write32(ENA_REGS_AENQ_HEAD_DB_OFF, ena.aenq_head);
+    }
+}
+
+static void poll(void)
+{
+    tx_return();
+    tx_provide(); /* in case a request from virt_tx arrived before the driver was ready */
+    rx_return();
+    rx_provide();
+    aenq_poll();
+
+    uint64_t now = now_ns();
+    if (now >= stats.next_print_ns) {
+        stats.next_print_ns = now + STATS_INTERVAL_NS;
+        LOG_ENA("rx %lu pkts / %lu B (errors %lu), tx %lu pkts / %lu B, inflight rx %u tx %u, aenq %lu\n",
+                stats.rx_pkts, stats.rx_bytes, stats.rx_errs, stats.tx_pkts, stats.tx_bytes, rxq.inflight,
+                txq.inflight, stats.aenq_events);
+    }
+    sddf_timer_set_timeout(timer_config.driver_id, POLL_INTERVAL_NS);
+}
+
+static bool io_init(void)
+{
+    net_queue_init(&rx_queue, config.virt_rx.free_queue.vaddr, config.virt_rx.active_queue.vaddr,
+                   config.virt_rx.num_buffers);
+    net_queue_init(&tx_queue, config.virt_tx.free_queue.vaddr, config.virt_tx.active_queue.vaddr,
+                   config.virt_tx.num_buffers);
+    ena.aenq_head = ENA_ASYNC_QUEUE_DEPTH; /* as ena_com_admin_init_aenq() of the reference */
+    ena.aenq_phase = 1;
+
+    if (!set_host_info()) {
+        LOG_ENA_ERR("setting the host info failed\n");
+        return false;
+    }
+    if (!set_mtu(ENA_MTU)) {
+        LOG_ENA_ERR("setting MTU %u failed\n", ENA_MTU);
+        return false;
+    }
+    LOG_ENA("host info set, MTU %u\n", ENA_MTU);
+    if (!create_queue(&txq, true, DMA_OFF_TX_SQ, DMA_OFF_TX_CQ)
+        || !create_queue(&rxq, false, DMA_OFF_RX_SQ, DMA_OFF_RX_CQ)) {
+        return false;
+    }
+    rx_provide();
+    LOG_ENA("RX buffers posted: %u (sDDF pool %u)\n", rxq.inflight, config.virt_rx.num_buffers);
+    return true;
+}
+
 void init(void)
 {
-    LOG_ENA("M5-1 bring-up (admin queue only, polling)\n");
+    assert(net_config_check_magic(&config));
+    LOG_ENA("M5-2 bring-up (admin queue, I/O queues, polling every %lu us)\n",
+            (unsigned long)(POLL_INTERVAL_NS / NS_IN_US));
     memset(&ena, 0, sizeof(ena));
     ena.mmio_resp = dma_vaddr(DMA_OFF_MMIO_RESP);
     ena.mmio_resp->req_id = 0;
@@ -448,16 +912,28 @@ void init(void)
     LOG_ENA("register reads: %s\n", ena.readless ? "readless (via DMA)" : "direct");
     write_mmio_resp_addr();
 
-    if (!dev_reset() || !validate_version() || !admin_init() || !read_device_info()) {
+    if (!dev_reset() || !validate_version() || !admin_init() || !read_device_info() || !io_init()) {
         LOG_ENA_ERR("bring-up failed\n");
         return;
     }
     ena.ready = true;
-    LOG_ENA("M5-1 done: admin queue works (no I/O queues yet)\n");
+    LOG_ENA("M5-2 ready: I/O queues up, polling\n");
+    stats.next_print_ns = now_ns() + STATS_INTERVAL_NS;
+    sddf_timer_set_timeout(timer_config.driver_id, POLL_INTERVAL_NS);
 }
 
 void notified(sddf_channel ch)
 {
-    /* M5-1: the data path is not implemented; requests from the virtualisers and timer ticks are ignored */
-    (void)ch;
+    if (!ena.ready) {
+        return;
+    }
+    if (ch == timer_config.driver_id) {
+        poll();
+    } else if (ch == config.virt_tx.id) {
+        tx_provide();
+    } else if (ch == config.virt_rx.id) {
+        rx_provide();
+    } else {
+        LOG_ENA_ERR("notification on unexpected channel %u\n", ch);
+    }
 }
