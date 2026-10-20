@@ -4,7 +4,7 @@
 Every response echoes what the backend actually received so tests can assert
 what the proxy forwarded (headers, body length, raw request line).
 """
-import json, sys, threading, time
+import json, os, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 NAMES = {19001: "A", 19002: "B"}
@@ -114,7 +114,8 @@ class S(ThreadingHTTPServer):
 if __name__ == "__main__":
     servers = []
     for port in (19001, 19002):
-        s = S(("127.0.0.1", port), H)
+        # mtabe19/qedos fork: QEDOS_BACKEND_BIND=0.0.0.0 for the EC2 backend instance (tools/ec2/backend.sh)
+        s = S((os.environ.get("QEDOS_BACKEND_BIND", "127.0.0.1"), port), H)
         servers.append(s)
         threading.Thread(target=s.serve_forever, daemon=True).start()
     print("backends up", flush=True)

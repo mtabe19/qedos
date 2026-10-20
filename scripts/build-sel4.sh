@@ -64,9 +64,14 @@ SDDF="$R/third_party/sddf"
 mkdir -p "$OUT" "$OUT/viper"
 
 # 1. Ensure signed configs and freestanding OpenSSL exist
-if [ ! -f "$R/config/sel4/proxy.sconf" ]; then
+# mtabe19/qedos fork: QEDOS_SIGNED_CONFIG replaces the signed config injected into policy_pd
+# (default config/sel4/proxy.sconf, the QEMU backends at 10.0.2.2; for EC2 see docs/STAGE_E_EC2.md 2.7)
+SIGNED_CONFIG=${QEDOS_SIGNED_CONFIG:-$R/config/sel4/proxy.sconf}
+if [ -z "${QEDOS_SIGNED_CONFIG:-}" ] && [ ! -f "$SIGNED_CONFIG" ]; then
   "$R/scripts/sign-config.sh"
 fi
+[ -f "$SIGNED_CONFIG" ] || { echo "signed config not found: $SIGNED_CONFIG" >&2; exit 1; }
+echo "signed config: $SIGNED_CONFIG"
 if [ ! -f "$OPENSSL_SEL4/lib/libssl.a" ]; then
   QEDOS_ARCH="$ARCH" "$R/scripts/build-openssl-sel4.sh"
 fi
@@ -145,8 +150,8 @@ llvm-objcopy --update-section .net_client_config="$OUT/net_client_tcp_pd.data" "
 llvm-objcopy --update-section .serial_client_config="$OUT/serial_client_tcp_pd.data" "$OUT/tcp_pd.elf"
 llvm-objcopy --update-section .lib_sddf_lwip_config="$OUT/lib_sddf_lwip_config_tcp_pd.data" "$OUT/tcp_pd.elf"
 
-# Inject the Ed25519-signed configuration (`config/sel4/proxy.sconf`, padded to 512B) into `policy_pd.elf`
-python3 - "$R/config/sel4/proxy.sconf" "$OUT/signed_config.data" <<'PY'
+# Inject the Ed25519-signed configuration (`config/sel4/proxy.sconf` or QEDOS_SIGNED_CONFIG, padded to 512B) into `policy_pd.elf`
+python3 - "$SIGNED_CONFIG" "$OUT/signed_config.data" <<'PY'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
 data = open(src, "rb").read()

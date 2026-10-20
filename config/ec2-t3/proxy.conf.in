@@ -1,0 +1,19 @@
+# mtabe19/qedos fork (Stage E): seL4 appliance configuration for EC2 (QEDOS_PROFILE=ec2-t3).
+# Template: the placeholder in the two backend lines is replaced with the private IPv4 of the backend
+# instance's fixed ENI (tools/ec2/backend.sh), in the same subnet as QEDOS. The filled-in copy and its
+# signed form stay in build/ec2/ (not committed). Commands: docs/STAGE_E_EC2.md 2.7.
+# Routes are the same as config/sel4/proxy.conf so that the SEL4_004/005 checks apply unchanged.
+listen 0.0.0.0:8443
+cert   config/dev/cert.pem
+key    config/dev/key.pem
+max_conns 64
+
+backend a @BACKEND_IP@:19001
+backend b @BACKEND_IP@:19002
+
+route GET  /health      health
+route POST /api/chat    a max_body=1048576
+route GET  /api/models  a
+route GET  /api/events  a
+route GET  /game/*      b
+route POST /game/*      b max_body=65536

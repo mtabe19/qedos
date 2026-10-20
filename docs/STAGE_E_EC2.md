@@ -168,7 +168,69 @@ IP=$(sed -n 's/.*public IPv4: \([0-9.]*\).*/\1/p' /tmp/boot.log); tools/ec2/http
   TLS 1.2 と従来の鍵交換は拒否)。VM の QEMU に対しても `tools/ec2/https-check.sh 127.0.0.1 18443` で使える
 - `boot-test.sh` は running になったときにパブリック IPv4 を表示する。終わったら Ctrl-C で止めてよい (片付けは行われる)。
   `tee` には `-i` を付ける。付けないと Ctrl-C で tee が先に終わり、片付けの出力がログに残らない
-  (以前は片付けの最初の出力で SIGPIPE になりインスタンスが残っていた。今は `on_exit` が SIGPIPE を無視して最後まで片付ける)
+  (以前は片付けの最初の出力で SIGPIPE になりインスタンスが残っていた。今は `on_exit` が SIGPIPE を無視して最後まで片付ける。
+  2026-10-20 の M5-5 で、Ctrl-C の後に片付けが最後まで行われ、その出力もログに残ることを EC2 で確認)
+
+### 2.7 backend への転送 (M5-5)
+
+転送先は署名済みの設定 (`proxy.sconf`) の backend 表だけで決まる (LAW_004、`connector_pd.c`)。
+`config/sel4/proxy.conf` の backend は QEMU 用の `10.0.2.2` なので、EC2 では backend 用のインスタンスを
+QEDOS と同じサブネットに置き、そのプライベート IPv4 を入れた設定を署名して焼き込む。
+
+- 雛形 `config/ec2-t3/proxy.conf.in` (route は `config/sel4/proxy.conf` と同じ)。IP を入れたものと署名済みのものは
+  `build/ec2/` に置き、commit しない
+- 署名鍵は上流の開発用の鍵 (`config/keys/`、公開済み) のまま。実際のサービスを載せるときは自分の鍵を作り、
+  `crates/pg-config/src/lib.rs` の `PUBLIC_KEY` を差し替える
+- backend は `tools/ec2/backend.sh up|down`。Amazon Linux 2023 (t3.micro) で `tests/backend.py` を 0.0.0.0 で動かす
+  (`QEDOS_BACKEND_BIND`)。鍵ペア・SSH なし。`QEDOS_BACKEND_MINUTES` (既定 120 分) で自分で終了する
+
+初回のみ (Mac で。ID と IP は `build/ec2/eni.env` に足す):
+
+```sh
+set -a; . build/ec2/eni.env; set +a
+aws ec2 describe-network-interfaces --network-interface-ids "$QEDOS_EC2_ENI" \
+  --query 'NetworkInterfaces[0].[SubnetId,VpcId]' --output text --profile qedos   # QEDOS の ENI のサブネットと VPC
+aws ec2 create-security-group --group-name qedos-stage-e-backend-sg --description "QEDOS Stage E test backends" \
+  --vpc-id <VPC> --query GroupId --output text --profile qedos
+aws ec2 authorize-security-group-ingress --group-id <backend SG> \
+  --ip-permissions "IpProtocol=tcp,FromPort=19001,ToPort=19002,UserIdGroupPairs=[{GroupId=$QEDOS_EC2_SG}]" --profile qedos
+aws ec2 create-network-interface --subnet-id <サブネット> --groups <backend SG> --description qedos-stage-e-backend \
+  --tag-specifications 'ResourceType=network-interface,Tags=[{Key=Name,Value=qedos-stage-e-backend-eni},{Key=project,Value=qedos-stage-e}]' \
+  --query 'NetworkInterface.[NetworkInterfaceId,PrivateIpAddress]' --output text --profile qedos
+# build/ec2/eni.env に追加:
+#   QEDOS_BACKEND_SG=sg-...
+#   QEDOS_BACKEND_ENI=eni-...
+#   QEDOS_BACKEND_IP=172.31.x.x
+```
+
+ビルド (VM):
+
+```sh
+QEDOS_BACKEND_IP=<backend の IP>
+mkdir -p build/ec2
+sed "s/@BACKEND_IP@/$QEDOS_BACKEND_IP/" config/ec2-t3/proxy.conf.in > build/ec2/proxy-ec2.conf
+scripts/sign-config.sh --sconf build/ec2/proxy-ec2.conf build/ec2/proxy-ec2.sconf
+QEDOS_PROFILE=ec2-t3 QEDOS_NET_MAC=<MAC> QEDOS_SIGNED_CONFIG=build/ec2/proxy-ec2.sconf scripts/build-sel4.sh
+QEDOS_SEL4_DIR=build/sel4-x86_64_generic-ec2-t3 tools/mk-grub-disk.sh build/disk/qedos-bios-ec2.img
+# 確認の手順を QEMU で先に確かめる (既定の設定でビルドした build/sel4-x86_64_generic で QEMU を起動し、tests/backend.py を動かしておく)
+tools/ec2/https-check.sh --backend 10.0.2.2 127.0.0.1 18443
+```
+
+起動試験 (Mac):
+
+```sh
+set -a; . build/ec2/eni.env; set +a
+tools/ec2/backend.sh up            # "backends up at ..." が出るまで待つ
+# ターミナル 1
+QEDOS_CONSOLE_SECONDS=600 QEDOS_DISK_IMG=build/disk/qedos-bios-ec2.img tools/ec2/boot-test.sh 2>&1 | tee -i /tmp/boot.log
+# ターミナル 2 (DHCP の後)
+IP=$(sed -n 's/.*public IPv4: \([0-9.]*\).*/\1/p' /tmp/boot.log); tools/ec2/https-check.sh --backend "$QEDOS_BACKEND_IP" "$IP"
+# 終わったら
+tools/ec2/backend.sh down
+```
+
+- `https-check.sh --backend` は 1〜3 に加えて SEL4_004 と同じ転送の確認 (4a/4b) と、SEL4_005 と同じ拒否の確認 (5.1〜5.5、
+  ステータスコードのみ) を行う。backend 側に漏れていないかの件数は、backend に外から届かないので確認しない
 
 ## 3. 結果
 
@@ -191,6 +253,7 @@ IP=$(sed -n 's/.*public IPv4: \([0-9.]*\).*/\1/p' /tmp/boot.log); tools/ec2/http
 | M5-2 | 送受信キュー各 1 本 (深さ 256、ホストメモリ配置)、1ms ごとのポーリング、ホスト情報と MTU 1500 の設定 | **成功**。`TCP_PD: DHCP lease acquired` (IP は ENI のプライベート IP と一致)。送信 350B x2 / 受信 590B x2 (DHCP)、送信 42B x4 (ARP と推測)、エラー 0 |
 | M5-3 | MSI-X (入口 0/1/2 を同じ vector 106 へ、送信 CQ 1・受信 CQ 2)、ポーリングは 100ms の予備のみ | **成功**。DHCP 取得後、割り込み 12 回 / 予備ポーリングで見つかった完了 0。途中で届いた ARP (と推測) にも応答 |
 | M5-4 | 手元の Mac からパブリック IPv4 の 8443 へ `tools/ec2/https-check.sh` | **成功**。TLS 1.3 + X25519MLKEM768 + AES-256-GCM で GET /health -> 200 (1 秒未満)、TLS 1.2 と X25519 / P-256 単独は拒否。コンソールにも `TLS_PD: handshake OK ... X25519MLKEM768` と `handshake rejected (LAW_002/LAW_003)` x3。割り込み 55 回 / 予備ポーリング 0。backend への転送は未確認 (転送先が QEMU 用の 10.0.2.2) |
+| M5-5 | 同じサブネットの backend (AL2023 t3.micro + `tests/backend.py`、固定 ENI) の IP を入れて署名した設定で、手元の Mac から `tools/ec2/https-check.sh --backend` | **成功**。1〜5.5 がすべて PASS: POST /api/chat は backend A、GET /game/score は backend B に届き、Host は `backend IP:ポート` に固定、X-Forwarded-For は削除。不正なリクエストは 400/404/405。コンソールに `POLICY_PD: Ed25519 signed config verified OK`。ENA からの外向き TCP も動作。試験中のコンソール出力は取れていない (コンソールの更新が遅く、その前に Ctrl-C で止めたため) |
 
 M2 の上流ビルド済みイメージとの比較:
 
@@ -283,7 +346,8 @@ ENA (M5-1 のドライバが表示した値、Legacy BIOS 起動):
      ENA の入口 0/1/2 に同じアドレスとデータを書いて 1 つの IRQ で受ける。seL4 は MSI のアドレスとデータを設定しないので
      ドライバが書く (アドレス `0xFEE00000`、データは vector + 0x30。Microkit 2.3.1 の実機で確認)。100ms の予備ポーリングは残す
    - ~~M5-4~~ (済): HTTPS の疎通。専用のセキュリティグループで自分の IP からだけ 8443 を許可し、`https-check.sh` で確認
-   - 次: backend への転送 (EC2 から届く転送先と、それを指す署名済み設定)、性能 (TSC の周波数、項目 8)
+   - ~~M5-5~~ (済、2.7): backend への転送。同じサブネットの試験用 backend (AL2023 + `tests/backend.py`) と、その IP を入れた署名済み設定
+   - 次: 実際のサービスへの転送 (自分の署名鍵)、性能 (TSC の周波数、項目 8)
 6. **IOMMU**: EC2 では使えない前提で、NIC を信頼境界に含めることを評価記録に明記する
 7. **UEFI 版ディスクイメージ**: UEFI のみのインスタンスタイプ向け。上流計画にある GRUB + UEFI の問題を QEMU (OVMF) で先に確認する
 8. **TSC の周波数**: EC2 では CPUID 0x15/0x16 から取れず、時刻の読み出しが HPET になる (性能の問題)。

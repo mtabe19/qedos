@@ -3,12 +3,15 @@
 #
 # Usage:
 #   scripts/sign-config.sh [--key KEY.pem] [FILE.conf ...]
+#   scripts/sign-config.sh [--key KEY.pem] --sconf CONF OUT.sconf   (mtabe19/qedos fork)
 #
 # With no FILE arguments, signs config/{dev,test,perf}/proxy.conf producing
 # <file>.sig sidecars and writes the binary signed config config/sel4/proxy.sconf.
+# With --sconf, writes only the binary signed config of CONF to OUT.sconf (e.g. the EC2 config
+# made from config/ec2-t3/proxy.conf.in, see docs/STAGE_E_EC2.md 2.7).
 set -eu
 R=$(cd "$(dirname "$0")/.." && pwd)
-O=$R/third_party/openssl-install/bin/openssl
+O=${OPENSSL:-$R/third_party/openssl-install/bin/openssl}
 export OPENSSL_CONF=$R/config/openssl-min.cnf
 
 KEY=$R/config/keys/config-signing-key.pem
@@ -23,19 +26,32 @@ sign_one() {
   printf "%s\n" "$sig_hex" > "${f}.sig"
 }
 
-if [ $# -gt 0 ]; then
+SCONF_IN=""
+SCONF_OUT=""
+if [ "${1:-}" = "--sconf" ]; then
+  [ $# -eq 3 ] || { echo "usage: $0 [--key KEY.pem] --sconf CONF OUT.sconf" >&2; exit 2; }
+  SCONF_IN=$2
+  SCONF_OUT=$3
+  set --
+fi
+
+if [ -z "$SCONF_IN" ] && [ $# -gt 0 ]; then
   for f in "$@"; do
     sign_one "$f"
   done
   exit 0
 fi
 
-for f in "$R/config/dev/proxy.conf" "$R/config/test/proxy.conf" "$R/config/perf/proxy.conf" "$R/config/sel4/proxy.conf"; do
-  [ -f "$f" ] && sign_one "$f"
-done
+if [ -z "$SCONF_IN" ]; then
+  for f in "$R/config/dev/proxy.conf" "$R/config/test/proxy.conf" "$R/config/perf/proxy.conf" "$R/config/sel4/proxy.conf"; do
+    [ -f "$f" ] && sign_one "$f"
+  done
+  SCONF_IN=$R/config/sel4/proxy.conf
+  SCONF_OUT=$R/config/sel4/proxy.sconf
+  mkdir -p "$R/config/sel4"
+fi
 
-mkdir -p "$R/config/sel4"
-python3 - "$R" "$O" "$KEY" "$R/config/sel4/proxy.conf" "$R/config/sel4/proxy.sconf" <<'PY'
+python3 - "$R" "$O" "$KEY" "$SCONF_IN" "$SCONF_OUT" <<'PY'
 import os, struct, subprocess, sys, tempfile
 
 root, openssl_bin, key_pem, conf_path, out_sconf = sys.argv[1:]
@@ -102,4 +118,8 @@ assert len(p.stdout) == 64
 with open(out_sconf, "wb") as out:
     out.write(payload + p.stdout)
 PY
-echo "signed config/{dev,test,perf}/proxy.conf (.sig) and config/sel4/proxy.sconf"
+if [ "$SCONF_OUT" = "$R/config/sel4/proxy.sconf" ]; then
+  echo "signed config/{dev,test,perf}/proxy.conf (.sig) and config/sel4/proxy.sconf"
+else
+  echo "signed $SCONF_IN -> $SCONF_OUT"
+fi
