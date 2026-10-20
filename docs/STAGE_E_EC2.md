@@ -159,14 +159,16 @@ aws ec2 authorize-security-group-ingress --group-id <SG> --protocol tcp --port 8
 aws ec2 modify-network-interface-attribute --network-interface-id <ENI> --groups <SG>
 
 # ターミナル 1
-QEDOS_CONSOLE_SECONDS=600 QEDOS_DISK_IMG=build/disk/qedos-bios-ec2.img tools/ec2/boot-test.sh 2>&1 | tee /tmp/boot.log
+QEDOS_CONSOLE_SECONDS=600 QEDOS_DISK_IMG=build/disk/qedos-bios-ec2.img tools/ec2/boot-test.sh 2>&1 | tee -i /tmp/boot.log
 # ターミナル 2 (instance running の 1 分後、DHCP の後)
 IP=$(sed -n 's/.*public IPv4: \([0-9.]*\).*/\1/p' /tmp/boot.log); tools/ec2/https-check.sh "$IP"
 ```
 
 - `tools/ec2/https-check.sh IP [PORT]`: SEL4_001..003 と同じ確認 (TLS 1.3 + X25519MLKEM768 で GET /health -> 200、
   TLS 1.2 と従来の鍵交換は拒否)。VM の QEMU に対しても `tools/ec2/https-check.sh 127.0.0.1 18443` で使える
-- `boot-test.sh` は running になったときにパブリック IPv4 を表示する。終わったら Ctrl-C で止めてよい (片付けは行われる)
+- `boot-test.sh` は running になったときにパブリック IPv4 を表示する。終わったら Ctrl-C で止めてよい (片付けは行われる)。
+  `tee` には `-i` を付ける。付けないと Ctrl-C で tee が先に終わり、片付けの出力がログに残らない
+  (以前は片付けの最初の出力で SIGPIPE になりインスタンスが残っていた。今は `on_exit` が SIGPIPE を無視して最後まで片付ける)
 
 ## 3. 結果
 

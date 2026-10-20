@@ -84,7 +84,7 @@ cleanup() {
   fi
   if [ -n "$SNAP" ] && [ "$REUSED_SNAP" = 0 ]; then
     log "delete snapshot $SNAP"
-    aws ec2 delete-snapshot --snapshot-id "$SNAP" || log "WARN: delete-snapshot failed"
+    aws ec2 delete-snapshot --snapshot-id "$SNAP" >/dev/null || log "WARN: delete-snapshot failed"
   fi
   log "cleanup done"
 }
@@ -92,6 +92,8 @@ cleanup() {
 on_exit() {
   rc=$?
   trap - EXIT INT TERM
+  trap '' PIPE   # keep going even if the reader of stdout is gone (e.g. tee killed by Ctrl-C)
+  set +e         # clean up as far as possible; each step already logs its own WARN
   if [ "$KEEP" = 1 ]; then
     log "resources kept (state: $STATE). Clean up later with: tools/ec2/boot-test.sh --cleanup $STATE"
   else
