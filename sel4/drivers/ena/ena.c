@@ -7,8 +7,10 @@
  * Step M5-1: find the ENA on PCI, reset it, bring up the admin queue in polling mode and print the
  * device attributes (MAC address, MTU, queue limits).
  * Step M5-2: one TX and one RX queue (descriptors in host memory, one descriptor per packet), connected
- * to the sDDF net virtualisers. No interrupts yet: completions and the AENQ are polled on a periodic
- * timeout (POLL_INTERVAL_NS).
+ * to the sDDF net virtualisers.
+ * Step M5-3: MSI-X. Microkit allows one MSI per PCI device, so MSI-X entries 0 (management), 1 (TX CQ)
+ * and 2 (RX CQ) all get the same address/data and arrive as one IRQ (channel ENA_IRQ_CH). A periodic
+ * timeout (POLL_INTERVAL_NS) remains as a fallback and for the statistics.
  *
  * Register layout and admin command formats come from ena_defs/ (Amazon, BSD-3-Clause, see
  * ena_defs/README.md). The init sequence follows ena_com.c of the same source: ena_com_dev_reset(),
@@ -18,7 +20,8 @@
  *   - PCI 00:05.0, configuration space through I/O ports 0xCF8 (id 1) / 0xCFC (id 2)
  *   - BAR0 (16 KiB at 0xfebf4000 with legacy BIOS boot) mapped uncached at ENA_BAR0_VADDR
  *   - DMA memory "hw_net_rings" (64 KiB at paddr 0x7A000000) mapped at ENA_DMA_VADDR
- *   - timer client (used for timeouts; the data path will poll on it until MSI-X)
+ *   - timer client (timeouts during bring-up, fallback polling, statistics)
+ *   - MSI IRQ: pcidev 00:05.0, vector ENA_MSI_VECTOR, channel ENA_IRQ_CH
  */
 #include <stdbool.h>
 #include <stdint.h>
@@ -84,13 +87,26 @@ __attribute__((__section__(".timer_client_config"))) timer_client_config_t timer
 /* ---- I/O queues (M5-2) ---- */
 #define IO_QUEUE_DEPTH 256 /* power of two, device limit 1024 */
 #define ENA_MTU 1500       /* sDDF buffers are NET_BUFFER_SIZE (2048) bytes */
-#define POLL_INTERVAL_NS (1ULL * NS_IN_MS)
+#define POLL_INTERVAL_NS (100ULL * NS_IN_MS) /* fallback only (M5-3); 1 ms polling in M5-2 */
 #define STATS_INTERVAL_NS (5ULL * NS_IN_S)
 #define TRACE_FRAMES 6 /* print the first frames in each direction */
 /* ena_admin_host_info.os_type: there is no value for seL4; use the one of the FreeBSD driver this one
  * follows (ENA_ADMIN_OS_FREEBSD in ena_plat.h of the reference) */
 #define QEDOS_ENA_OS_TYPE 4
-#define QEDOS_ENA_DRIVER_VERSION 0x000201 /* 1.2.0 (major | minor << 8 | sub_minor << 16) */
+#define QEDOS_ENA_DRIVER_VERSION 0x000301 /* 1.3.0 (major | minor << 8 | sub_minor << 16) */
+
+/* ---- MSI-X (M5-3), must match sel4/meta_proofgate.py, profile ec2-t3 ---- */
+#define ENA_IRQ_CH 16
+#define ENA_MSI_VECTOR 106
+/* seL4 delivers Microkit/seL4 MSI vector v at CPU vector v + 0x30 (IRQ_INT_OFFSET 0x20 + 16 PIC lines,
+ * include/plat/pc99/plat/machine.h of the seL4 used by Microkit 2.3.0) */
+#define SEL4_X86_MSI_CPU_VECTOR(v) ((v) + 0x30)
+#define MSI_ADDR_APIC0 0xFEE00000u /* fixed destination: local APIC ID 0 (the only CPU in use) */
+#define MSIX_ENTRY_MGMT 0
+#define MSIX_ENTRY_TX 1
+#define MSIX_ENTRY_RX 2
+#define MSIX_ENTRIES_USED 3
+#define PCI_CAP_ID_MSIX 0x11
 
 #define MMIO_READ_TIMEOUT_NS (10ULL * NS_IN_MS)
 #define REG_READ_FAILED 0xFFFFFFFFu
@@ -146,6 +162,7 @@ typedef struct io_queue {
     volatile void *sq;
     volatile void *cq;
     volatile uint32_t *db;
+    volatile uint32_t *unmask;
     uint16_t sq_idx;
     uint16_t cq_idx;
     uint16_t sq_tail;
@@ -170,6 +187,8 @@ static struct {
     uint64_t tx_bytes;
     uint64_t rx_errs;
     uint64_t aenq_events;
+    uint64_t irqs;
+    uint64_t fallback_hits; /* completions found by the fallback poll, i.e. without an interrupt */
     uint64_t next_print_ns;
 } stats;
 
@@ -501,6 +520,65 @@ static bool read_device_info(void)
 
 /* ---- M5-2: host info, MTU, I/O queues and the polled data path ---- */
 
+static uint8_t pci_read8(uint8_t off)
+{
+    return (pci_read32(ENA_PCI_BUS, ENA_PCI_DEV, ENA_PCI_FUNC, off) >> ((off & 3) * 8)) & 0xff;
+}
+
+static uint16_t pci_read16(uint8_t off)
+{
+    return (pci_read32(ENA_PCI_BUS, ENA_PCI_DEV, ENA_PCI_FUNC, off) >> ((off & 2) * 8)) & 0xffff;
+}
+
+/* Find the MSI-X capability, point entries 0..MSIX_ENTRIES_USED-1 at our vector and enable MSI-X. */
+static bool msix_setup(void)
+{
+    uint8_t cap = 0;
+    uint16_t status = pci_read16(0x06);
+    if (status & (1u << 4)) {
+        uint8_t ptr = pci_read8(0x34) & 0xfc;
+        for (int guard = 0; ptr && guard < 48; guard++) {
+            if (pci_read8(ptr) == PCI_CAP_ID_MSIX) {
+                cap = ptr;
+                break;
+            }
+            ptr = pci_read8(ptr + 1) & 0xfc;
+        }
+    }
+    if (!cap) {
+        LOG_ENA_ERR("no MSI-X capability\n");
+        return false;
+    }
+    uint32_t dw0 = pci_read32(ENA_PCI_BUS, ENA_PCI_DEV, ENA_PCI_FUNC, cap);
+    uint16_t msg_ctrl = dw0 >> 16;
+    uint32_t table = pci_read32(ENA_PCI_BUS, ENA_PCI_DEV, ENA_PCI_FUNC, cap + 4);
+    uint16_t table_size = (msg_ctrl & 0x7ff) + 1;
+    uint32_t table_off = table & ~7u;
+    LOG_ENA("MSI-X capability at 0x%x: %u entries, table BAR%u+0x%x, control 0x%x\n", cap, table_size, table & 7,
+            table_off, msg_ctrl);
+    if ((table & 7) != 0 || table_off + table_size * 16 > 0x4000 || table_size < MSIX_ENTRIES_USED) {
+        LOG_ENA_ERR("unexpected MSI-X table location or size\n");
+        return false;
+    }
+
+    /* function mask while the table is written */
+    pci_write32(ENA_PCI_BUS, ENA_PCI_DEV, ENA_PCI_FUNC, cap, (dw0 & 0xffff) | ((uint32_t)(msg_ctrl | (1u << 14)) << 16));
+    uint32_t data = SEL4_X86_MSI_CPU_VECTOR(ENA_MSI_VECTOR); /* fixed delivery, edge */
+    for (int i = 0; i < MSIX_ENTRIES_USED; i++) {
+        volatile uint32_t *e = (volatile uint32_t *)(bar0 + table_off + i * 16);
+        e[0] = MSI_ADDR_APIC0;
+        e[1] = 0;
+        e[2] = data;
+        e[3] = 0; /* vector control: unmasked */
+    }
+    /* enable MSI-X, clear the function mask */
+    msg_ctrl = (msg_ctrl | (1u << 15)) & ~(1u << 14);
+    pci_write32(ENA_PCI_BUS, ENA_PCI_DEV, ENA_PCI_FUNC, cap, (dw0 & 0xffff) | ((uint32_t)msg_ctrl << 16));
+    LOG_ENA("MSI-X entries 0..%u -> address 0x%x data 0x%x (seL4 vector %u), control 0x%x\n", MSIX_ENTRIES_USED - 1,
+            MSI_ADDR_APIC0, data, ENA_MSI_VECTOR, pci_read16(cap + 2));
+    return true;
+}
+
 static void set_mem_addr(struct ena_common_mem_addr *a, uint64_t paddr)
 {
     a->mem_addr_low = (uint32_t)paddr;
@@ -558,7 +636,7 @@ static bool set_mtu(uint32_t mtu)
     return set_feature(ENA_ADMIN_MTU, &cmd) == 0;
 }
 
-static bool create_queue(io_queue_t *q, bool tx, uintptr_t sq_off, uintptr_t cq_off)
+static bool create_queue(io_queue_t *q, bool tx, uintptr_t sq_off, uintptr_t cq_off, uint16_t msix_entry)
 {
     uint16_t cdesc_size = tx ? sizeof(struct ena_eth_io_tx_cdesc) : sizeof(struct ena_eth_io_rx_cdesc_base);
     q->sq = dma_vaddr(sq_off);
@@ -575,13 +653,15 @@ static bool create_queue(io_queue_t *q, bool tx, uintptr_t sq_off, uintptr_t cq_
         q->free_ids[i] = IO_QUEUE_DEPTH - 1 - i;
     }
 
-    /* completion queue first, without interrupts (polling) */
+    /* completion queue first, interrupting on MSI-X entry msix_entry */
     struct ena_admin_aq_create_cq_cmd ccmd;
     struct ena_admin_acq_create_cq_resp_desc cresp;
     memset(&ccmd, 0, sizeof(ccmd));
     ccmd.aq_common_descriptor.opcode = ENA_ADMIN_CREATE_CQ;
+    ccmd.cq_caps_1 = ENA_ADMIN_AQ_CREATE_CQ_CMD_INTERRUPT_MODE_ENABLED_MASK;
     ccmd.cq_caps_2 = (cdesc_size / 4) & ENA_ADMIN_AQ_CREATE_CQ_CMD_CQ_ENTRY_SIZE_WORDS_MASK;
     ccmd.cq_depth = IO_QUEUE_DEPTH;
+    ccmd.msix_vector = msix_entry;
     set_mem_addr(&ccmd.cq_ba, dma_paddr(cq_off));
     _Static_assert(sizeof(ccmd) <= sizeof(struct ena_admin_aq_entry), "create cq command size");
     _Static_assert(sizeof(cresp) <= sizeof(struct ena_admin_acq_entry), "create cq response size");
@@ -598,6 +678,12 @@ static bool create_queue(io_queue_t *q, bool tx, uintptr_t sq_off, uintptr_t cq_
         LOG_ENA_ERR("%s CQ depth %u, requested %u\n", tx ? "TX" : "RX", cresp.cq_actual_depth, IO_QUEUE_DEPTH);
         return false;
     }
+    if (cresp.cq_interrupt_unmask_register_offset == 0 || cresp.cq_interrupt_unmask_register_offset + 4 > 0x4000) {
+        LOG_ENA_ERR("%s CQ unmask register offset 0x%x is outside BAR0\n", tx ? "TX" : "RX",
+                    cresp.cq_interrupt_unmask_register_offset);
+        return false;
+    }
+    q->unmask = (volatile uint32_t *)(bar0 + cresp.cq_interrupt_unmask_register_offset);
 
     /* submission queue, descriptors in host memory */
     struct ena_admin_aq_create_sq_cmd scmd;
@@ -628,9 +714,17 @@ static bool create_queue(io_queue_t *q, bool tx, uintptr_t sq_off, uintptr_t cq_
         return false;
     }
     q->db = (volatile uint32_t *)(bar0 + sresp.sq_doorbell_offset);
-    LOG_ENA("%s queue: sq %u (doorbell 0x%x), cq %u, depth %u\n", tx ? "TX" : "RX", q->sq_idx,
-            sresp.sq_doorbell_offset, q->cq_idx, IO_QUEUE_DEPTH);
+    LOG_ENA("%s queue: sq %u (doorbell 0x%x), cq %u (unmask 0x%x, MSI-X entry %u), depth %u\n", tx ? "TX" : "RX",
+            q->sq_idx, sresp.sq_doorbell_offset, q->cq_idx, cresp.cq_interrupt_unmask_register_offset, msix_entry,
+            IO_QUEUE_DEPTH);
     return true;
+}
+
+/* The device masks a CQ's interrupt after raising it; re-enable it (no moderation delays). */
+static inline void cq_unmask(io_queue_t *q)
+{
+    THREAD_MEMORY_FENCE();
+    *q->unmask = ENA_ETH_IO_INTR_REG_INTR_UNMASK_MASK;
 }
 
 static inline void sq_doorbell(io_queue_t *q)
@@ -706,8 +800,9 @@ static void rx_provide(void)
     }
 }
 
-static void rx_return(void)
+static unsigned rx_return(void)
 {
+    unsigned completed = 0;
     bool transferred = false;
     for (;;) {
         volatile struct ena_eth_io_rx_cdesc_base *c =
@@ -720,6 +815,7 @@ static void rx_return(void)
         uint16_t req_id = c->req_id;
         uint16_t len = c->length;
         cq_advance(&rxq);
+        completed++;
         if (req_id >= IO_QUEUE_DEPTH) {
             LOG_ENA_ERR("RX completion with invalid req_id %u\n", req_id);
             stats.rx_errs++;
@@ -750,6 +846,7 @@ static void rx_return(void)
         net_cancel_signal_active(&rx_queue);
         sddf_notify(config.virt_rx.id);
     }
+    return completed;
 }
 
 static void tx_provide(void)
@@ -794,8 +891,9 @@ static void tx_provide(void)
     }
 }
 
-static void tx_return(void)
+static unsigned tx_return(void)
 {
+    unsigned completed = 0;
     bool transferred = false;
     for (;;) {
         volatile struct ena_eth_io_tx_cdesc *c =
@@ -806,6 +904,7 @@ static void tx_return(void)
         THREAD_MEMORY_ACQUIRE();
         uint16_t req_id = c->req_id;
         cq_advance(&txq);
+        completed++;
         if (req_id >= IO_QUEUE_DEPTH) {
             LOG_ENA_ERR("TX completion with invalid req_id %u\n", req_id);
             continue;
@@ -822,6 +921,7 @@ static void tx_return(void)
         net_cancel_signal_free(&tx_queue);
         sddf_notify(config.virt_tx.id);
     }
+    return completed;
 }
 
 /* Asynchronous event notifications (keep-alive, link change, ...): consume them so the queue does not
@@ -852,20 +952,42 @@ static void aenq_poll(void)
     }
 }
 
-static void poll(void)
+/* Process both CQs, refill RX, consume the AENQ. Returns the number of completions handled. */
+static unsigned service(void)
 {
-    tx_return();
-    tx_provide(); /* in case a request from virt_tx arrived before the driver was ready */
-    rx_return();
+    unsigned n = tx_return();
+    tx_provide();
+    n += rx_return();
     rx_provide();
     aenq_poll();
+    return n;
+}
+
+static void handle_irq(void)
+{
+    stats.irqs++;
+    service();
+    cq_unmask(&txq);
+    cq_unmask(&rxq);
+    /* completions that arrived between the last check and the unmask raise a new interrupt */
+}
+
+/* Fallback poll (the interrupt should have handled everything) and statistics */
+static void poll(void)
+{
+    unsigned n = service();
+    if (n) {
+        stats.fallback_hits += n;
+        cq_unmask(&txq);
+        cq_unmask(&rxq);
+    }
 
     uint64_t now = now_ns();
     if (now >= stats.next_print_ns) {
         stats.next_print_ns = now + STATS_INTERVAL_NS;
-        LOG_ENA("rx %lu pkts / %lu B (errors %lu), tx %lu pkts / %lu B, inflight rx %u tx %u, aenq %lu\n",
-                stats.rx_pkts, stats.rx_bytes, stats.rx_errs, stats.tx_pkts, stats.tx_bytes, rxq.inflight,
-                txq.inflight, stats.aenq_events);
+        LOG_ENA("rx %lu pkts / %lu B (errors %lu), tx %lu pkts / %lu B, inflight rx %u tx %u, aenq %lu, irqs %lu, "
+                "fallback %lu\n", stats.rx_pkts, stats.rx_bytes, stats.rx_errs, stats.tx_pkts, stats.tx_bytes,
+                rxq.inflight, txq.inflight, stats.aenq_events, stats.irqs, stats.fallback_hits);
     }
     sddf_timer_set_timeout(timer_config.driver_id, POLL_INTERVAL_NS);
 }
@@ -888,11 +1010,16 @@ static bool io_init(void)
         return false;
     }
     LOG_ENA("host info set, MTU %u\n", ENA_MTU);
-    if (!create_queue(&txq, true, DMA_OFF_TX_SQ, DMA_OFF_TX_CQ)
-        || !create_queue(&rxq, false, DMA_OFF_RX_SQ, DMA_OFF_RX_CQ)) {
+    if (!msix_setup()) {
+        return false;
+    }
+    if (!create_queue(&txq, true, DMA_OFF_TX_SQ, DMA_OFF_TX_CQ, MSIX_ENTRY_TX)
+        || !create_queue(&rxq, false, DMA_OFF_RX_SQ, DMA_OFF_RX_CQ, MSIX_ENTRY_RX)) {
         return false;
     }
     rx_provide();
+    cq_unmask(&txq);
+    cq_unmask(&rxq);
     LOG_ENA("RX buffers posted: %u (sDDF pool %u)\n", rxq.inflight, config.virt_rx.num_buffers);
     return true;
 }
@@ -900,8 +1027,8 @@ static bool io_init(void)
 void init(void)
 {
     assert(net_config_check_magic(&config));
-    LOG_ENA("M5-2 bring-up (admin queue, I/O queues, polling every %lu us)\n",
-            (unsigned long)(POLL_INTERVAL_NS / NS_IN_US));
+    LOG_ENA("M5-3 bring-up (admin queue, I/O queues, MSI-X; fallback poll every %lu ms)\n",
+            (unsigned long)(POLL_INTERVAL_NS / NS_IN_MS));
     memset(&ena, 0, sizeof(ena));
     ena.mmio_resp = dma_vaddr(DMA_OFF_MMIO_RESP);
     ena.mmio_resp->req_id = 0;
@@ -917,9 +1044,10 @@ void init(void)
         return;
     }
     ena.ready = true;
-    LOG_ENA("M5-2 ready: I/O queues up, polling\n");
+    LOG_ENA("M5-3 ready: I/O queues up, MSI-X enabled\n");
     stats.next_print_ns = now_ns() + STATS_INTERVAL_NS;
     sddf_timer_set_timeout(timer_config.driver_id, POLL_INTERVAL_NS);
+    sddf_irq_ack(ENA_IRQ_CH);
 }
 
 void notified(sddf_channel ch)
@@ -927,7 +1055,10 @@ void notified(sddf_channel ch)
     if (!ena.ready) {
         return;
     }
-    if (ch == timer_config.driver_id) {
+    if (ch == ENA_IRQ_CH) {
+        handle_irq();
+        sddf_deferred_irq_ack(ch);
+    } else if (ch == timer_config.driver_id) {
         poll();
     } else if (ch == config.virt_tx.id) {
         tx_provide();

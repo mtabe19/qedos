@@ -98,7 +98,10 @@ def main() -> None:
             ena_bar0 = MemoryRegion(sdf, "ena_bar0", 0x4000, paddr=0xFEBF4000)
             sdf.add_mr(ena_bar0)
             ethernet_driver.add_map(Map(ena_bar0, 0x6000_0000, "rw", cached=False))
-            # No IRQ yet: the driver polls on a periodic timeout (MSI-X later).
+            # MSI-X (M5-3): one MSI per PCI device in Microkit, shared by all ENA MSI-X entries.
+            # vector/id must match ENA_MSI_VECTOR / ENA_IRQ_CH in sel4/drivers/ena/ena.c.
+            ethernet_driver.add_irq(SystemDescription.IrqMsi(pci_bus=0, pci_device=5, pci_func=0, vector=106, handle=0, id=16))
+            # Timer: timeouts during bring-up, fallback polling and statistics.
             timer_system.add_client(ethernet_driver)
         ethernet_driver.add_ioport(SystemDescription.IoPort(0xCF8, 4, 1))
         ethernet_driver.add_ioport(SystemDescription.IoPort(0xCFC, 4, 2))

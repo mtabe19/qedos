@@ -169,6 +169,7 @@ QEDOS_DISK_IMG=build/disk/qedos-bios-ec2.img tools/ec2/boot-test.sh
 | M5-1 (1 回目) | ENA ドライバ (PCI 確認、リセット、管理キュー、GET_FEATURE)、固定 ENI で起動 | BAR0 が `0xfebf4000` (プロファイルの `0xc0400000` と違う) でドライバの確認により停止 |
 | M5-1 (2 回目) | BAR0 を `0xfebf4000` に修正 | **成功**。readless 読み出し、リセット、管理キュー (ポーリング) が動作し、MAC が ENI と一致 |
 | M5-2 | 送受信キュー各 1 本 (深さ 256、ホストメモリ配置)、1ms ごとのポーリング、ホスト情報と MTU 1500 の設定 | **成功**。`TCP_PD: DHCP lease acquired` (IP は ENI のプライベート IP と一致)。送信 350B x2 / 受信 590B x2 (DHCP)、送信 42B x4 (ARP と推測)、エラー 0 |
+| M5-3 | MSI-X (入口 0/1/2 を同じ vector 106 へ、送信 CQ 1・受信 CQ 2)、ポーリングは 100ms の予備のみ | **成功**。DHCP 取得後、割り込み 12 回 / 予備ポーリングで見つかった完了 0。途中で届いた ARP (と推測) にも応答 |
 
 M2 の上流ビルド済みイメージとの比較:
 
@@ -227,6 +228,7 @@ ENA (M5-1 のドライバが表示した値、Legacy BIOS 起動):
 | キューの上限 | 送受信それぞれ SQ/CQ 8 本、深さ 1024、送信ヘッダ最大 128、1 パケットの記述子 送信 17 / 受信 28 |
 | I/O キュー (M5-2) | 送信 sq 0 / cq 0 (SQ ドアベル BAR0+0x100)、受信 sq 0 / cq 1 (SQ ドアベル BAR0+0x300)。ホスト情報 (HOST_ATTR_CONFIG) と MTU の SET_FEATURE は成功 |
 | AENQ | M5-2 の試験中の通知は 0 件 (通知グループを SET_FEATURE AENQ_CONFIG で設定していないためと推測) |
+| MSI-X (M5-3) | 能力は PCI `0xb0`、9 entries、表は BAR0+0x2000。CQ の unmask レジスタ 送信 BAR0+0x504 / 受信 BAR0+0x508。アドレス `0xfee00000`、データ `0x9a` (seL4 vector 106 + 0x30) で届いた |
 
 ### 4.2 Amazon Linux 2023 での調査から (`collect-facts.sh`, 2026-10-20)
 
@@ -239,7 +241,7 @@ ENA (M5-1 のドライバが表示した値、Legacy BIOS 起動):
 | チップセット | **i440FX + PIIX3/PIIX4** (QEMU の q35 とは別)。PCI 設定空間は conf1 (`0xcf8`) |
 | PCI | 00:03.0 VGA (1d0f:1111)、00:04.0 NVMe EBS (1d0f:8061)、00:05.0 **ENA (1d0f:ec20)** |
 | PCI MMIO 窓 | `0xc0000000-0xfebfffff` (64 ビット側は `0x140000000-`) |
-| ENA | BAR0 のみ `0xc0400000` 16KB (32 ビット, non-prefetchable、LLQ 用 BAR2 なし。アドレスは UEFI 起動時の値で、Legacy BIOS では `0xfebf4000`、4.1)。**MSI-X のみ** (9 ベクタ、テーブル BAR0+0x2000、PBA BAR0+0x3000)、INTx 無効 |
+| ENA | BAR0 のみ `0xc0400000` 16KB (32 ビット, non-prefetchable、LLQ 用 BAR2 なし。アドレスは UEFI 起動時の値で、Legacy BIOS では `0xfebf4000`、4.1)。**MSI-X のみ** (9 ベクタ、能力は PCI `0xb0`、テーブル BAR0+0x2000、PBA BAR0+0x3000)、INTx 無効 |
 | RAM (Linux の e820) | `0x1000-0x9ffff`、`0x100000-0xbbccdfff`、`0xbbfde000-0xbff7bfff`、`0x100000000-0x13b3fffff` |
 | IOAPIC / シリアル | IOAPIC `0xfec00000` GSI 0-23。COM1 16550A `0x3f8` IRQ 4 |
 
@@ -256,9 +258,9 @@ ENA (M5-1 のドライバが表示した値、Legacy BIOS 起動):
 5. **ENA ドライバ** (`sel4/drivers/ena/`、Amazon の ena_defs は BSD-3-Clause): 段階的に進める
    - ~~M5-1~~ (済): PCI 確認、リセット、管理キュー (ポーリング)、属性の取得
    - ~~M5-2~~ (済): 送受信のキュー各 1 本 (ホストメモリ配置)、タイマーで 1ms ごとにポーリング。VPC の DHCP からアドレスを取得
-   - M5-3: MSI-X。Microkit 2.3.1 は `<irq pcidev=... handle=... vector=...>` に対応するが、seL4 は MSI のアドレスとデータを
-     設定しないので、ドライバが MSI-X テーブルに書く (アドレス `0xFEE00000`、データは vector + 0x30。seL4 master のソースから。
-     2.3.1 の seL4 でも同じかは未確認)
+   - ~~M5-3~~ (済): MSI-X。Microkit は MSI を 1 つの PCI デバイスにつき 1 つしか持てない (`sdf.rs` の重複チェック) ため、
+     ENA の入口 0/1/2 に同じアドレスとデータを書いて 1 つの IRQ で受ける。seL4 は MSI のアドレスとデータを設定しないので
+     ドライバが書く (アドレス `0xFEE00000`、データは vector + 0x30。Microkit 2.3.1 の実機で確認)。100ms の予備ポーリングは残す
    - M5-4: HTTPS の疎通 (どこから接続するかはその時に決める)
 6. **IOMMU**: EC2 では使えない前提で、NIC を信頼境界に含めることを評価記録に明記する
 7. **UEFI 版ディスクイメージ**: UEFI のみのインスタンスタイプ向け。上流計画にある GRUB + UEFI の問題を QEMU (OVMF) で先に確認する
