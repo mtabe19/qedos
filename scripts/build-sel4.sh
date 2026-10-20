@@ -12,15 +12,21 @@ export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/opt/lld
 # build/sel4-$BOARD, so the upstream prebuilt image in build/sel4 is kept as a baseline (Stage E).
 # QEDOS_BOARD defaults to x86_64_generic / qemu_virt_aarch64 (also: rpi4b_1gb).
 ARCH=${QEDOS_ARCH:-x86_64}
+HPET_ARG=""
 case "$ARCH" in
   x86_64)
     BOARD=${QEDOS_BOARD:-x86_64_generic}
+    # mtabe19/qedos fork: QEDOS_HPET_FORCE_32BIT=1 -> sDDF timer in 32-bit mode, output build/sel4-$BOARD-hpet32
+    SUFFIX=""
+    if [ "${QEDOS_HPET_FORCE_32BIT:-0}" = 1 ]; then SUFFIX=-hpet32; fi
+    # mtabe19/qedos fork: HPET timer IRQ pin, same default as scripts/build-sddf.sh
+    HPET_ARG="--hpet-ioapic-pin ${QEDOS_HPET_IOAPIC_PIN:-23}"
     RUST_TARGET=x86_64-unknown-none
     CLANG_TARGET="-target x86_64-none-elf"
     ARCH_CFLAGS="-mno-red-zone"
     OPENSSL_SEL4="$R/third_party/openssl-sel4"
-    ECHO_DIR="$R/build/echo-$BOARD"
-    OUT="$R/build/sel4-$BOARD"
+    ECHO_DIR="$R/build/echo-$BOARD$SUFFIX"
+    OUT="$R/build/sel4-$BOARD$SUFFIX"
     ;;
   aarch64)
     BOARD=${QEDOS_BOARD:-qemu_virt_aarch64}
@@ -48,9 +54,9 @@ fi
 if [ ! -f "$OPENSSL_SEL4/lib/libssl.a" ]; then
   QEDOS_ARCH="$ARCH" "$R/scripts/build-openssl-sel4.sh"
 fi
-if [ ! -f "$ECHO_DIR/eth_driver.elf" ]; then
-  QEDOS_BOARD="$BOARD" "$R/scripts/build-sddf.sh"
-fi
+# mtabe19/qedos fork: always run build-sddf.sh so that changes in patches/sddf/ are picked up
+# (make rebuilds only what changed)
+QEDOS_BOARD="$BOARD" "$R/scripts/build-sddf.sh"
 
 # 2. Build the Rust `#![no_std]` static library (`libpg_sel4_pds.a`) for x86_64-unknown-none
 cargo build --manifest-path "$R/sel4/rust_pds/Cargo.toml" --target "$RUST_TARGET" --release
@@ -94,7 +100,7 @@ done
 # 8. Generate `proofgate.system` and sDDF `.data` sections, then patch ELFs
 DTB_ARG=""
 [ "$ARCH" = aarch64 ] && DTB_ARG="--dtb $ECHO_DIR/$BOARD.dtb"
-python3 "$R/sel4/meta_proofgate.py" --sddf "$SDDF" --output "$OUT" --sdf proofgate.system --board "$BOARD" $DTB_ARG
+python3 "$R/sel4/meta_proofgate.py" --sddf "$SDDF" --output "$OUT" --sdf proofgate.system --board "$BOARD" $DTB_ARG $HPET_ARG
 
 cp "$OUT/network_copy.elf" "$OUT/network_copy0.elf"
 llvm-objcopy --update-section .device_resources="$OUT/serial_driver_device_resources.data" "$OUT/serial_driver.elf"

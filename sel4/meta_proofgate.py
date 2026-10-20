@@ -23,6 +23,8 @@ def main() -> None:
     parser.add_argument("--board", default="x86_64_generic",
                         help="Microkit board: x86_64_generic (default), qemu_virt_aarch64, rpi4b_1gb")
     parser.add_argument("--dtb", default=None, help="board DTB (required for aarch64 boards)")
+    # mtabe19/qedos fork: I/O APIC pin of the HPET timer IRQ (x86); must match the timer driver's HPET_IOAPIC_PIN
+    parser.add_argument("--hpet-ioapic-pin", type=int, default=2)
     args = parser.parse_args()
 
     sys.path.append(os.path.join(args.sddf, "tools/meta"))
@@ -53,7 +55,7 @@ def main() -> None:
     timer_driver = ProtectionDomain("timer_driver", "timer_driver.elf", priority=102, cpu=0)
     timer_system = Sddf.Timer(sdf, timer_node, timer_driver)
     if is_x86:
-        add_x86_hpet(sdf, timer_driver)
+        add_x86_hpet(sdf, timer_driver, ioapic_pin=args.hpet_ioapic_pin)
 
     serial_driver = ProtectionDomain("serial_driver", "serial_driver.elf", priority=100, cpu=0)
     serial_virt_tx = ProtectionDomain("serial_virt_tx", "serial_virt_tx.elf", priority=99, cpu=0)

@@ -1,0 +1,261 @@
+diff --git a/drivers/timer/tsc_hpet/timer.c b/drivers/timer/tsc_hpet/timer.c
+index 1413f84..71435f6 100644
+--- a/drivers/timer/tsc_hpet/timer.c
++++ b/drivers/timer/tsc_hpet/timer.c
+@@ -17,6 +17,26 @@
+  * 1. IA-PC HPET (High Precision Event Timers) Specification
+  */
+ 
++/* 32-bit main counter support (mtabe19/qedos fork, Stage E):
++ * Some HPETs only have a 32-bit main counter, e.g. AWS EC2 Nitro (t3: 62.5 MHz, wraps every ~68.7 s).
++ * In that case the counter is extended to 64 bits in software, and the comparator is always armed
++ * at most half a wrap ahead (also when no timeout is pending), so that every wrap is observed.
++ * Define HPET_FORCE_32BIT to use this mode on a 64-bit HPET as well (for testing, e.g. on QEMU). It also
++ * starts the counter HPET_FORCE_32BIT_WRAP_SECONDS before a wrap, so that tests cross a wrap early, and
++ * does not use legacy replacement routing (like EC2, see below).
++ *
++ * IRQ routing: timer 0 interrupts I/O APIC input HPET_IOAPIC_PIN, which must match the IRQ in the system
++ * description (add_x86_hpet() in tools/meta/board.py, ioapic_pin). With the default pin 2 the legacy
++ * replacement route is used when the HPET has one. Otherwise (another pin, or no legacy replacement route,
++ * e.g. AWS EC2 Nitro whose timer 0 can only reach pins 16-23) timer 0 is routed directly to the pin through
++ * TN_INT_ROUTE_CNF, and the pin must be listed in its TN_INT_ROUTE_CAP. */
++#ifndef HPET_IOAPIC_PIN
++#define HPET_IOAPIC_PIN 2
++#endif
++#ifndef HPET_FORCE_32BIT_WRAP_SECONDS
++#define HPET_FORCE_32BIT_WRAP_SECONDS 5
++#endif
++
+ __attribute__((__section__(".device_resources"), retain, used)) device_resources_t device_resources;
+ 
+ /* hpet data structures / memory maps
+@@ -97,9 +117,30 @@ uint64_t tsc_freq = 0;
+ uint64_t timeouts[MAX_TIMEOUTS];
+ uint64_t next_timeout = UINT64_MAX;
+ 
++/* 32-bit mode: true if the main counter (or, with HPET_FORCE_32BIT, its low 32 bits) is used as a
++ * 32-bit counter. hpet_ext_high / hpet_last_low extend it to 64 bits in software. This PD is
++ * single threaded (protected() and notified() never run concurrently), so no locking is needed. */
++static bool hpet_32bit = false;
++static uint64_t hpet_ext_high = 0;
++static uint32_t hpet_last_low = 0;
++static uint64_t hpet_wraps = 0;
++/* Arm the comparator at most this many ticks ahead in 32-bit mode (half a wrap). */
++#define HPET_32BIT_MAX_ARM (1ULL << 31)
++
+ uint64_t get_hpet_ticks(void)
+ {
+-    return *(volatile uint64_t *)(HPET_REGION + HPET_MAIN_COUNTER_REG);
++    if (!hpet_32bit) {
++        return *(volatile uint64_t *)(HPET_REGION + HPET_MAIN_COUNTER_REG);
++    }
++    uint32_t low = *(volatile uint32_t *)(HPET_REGION + HPET_MAIN_COUNTER_REG);
++    if (low < hpet_last_low) {
++        /* wrapped since the last read */
++        hpet_ext_high += 1ULL << 32;
++        hpet_wraps++;
++        sddf_dprintf("TIMER DRIVER|INFO: HPET 32-bit counter wrapped (%lu)\n", hpet_wraps);
++    }
++    hpet_last_low = low;
++    return hpet_ext_high | low;
+ }
+ 
+ uint64_t ns_to_hpet_ticks(uint64_t ns)
+@@ -117,20 +158,47 @@ void set_timeout(uint64_t timeout)
+     timer_0->comparator = timeout;
+ }
+ 
++/* 32-bit mode: arm the comparator for `timeout` (extended ticks), but at most half a wrap ahead of
++ * `curr_ticks`. Returns the extended tick value that was armed. */
++static uint64_t set_timeout_32bit(uint64_t timeout, uint64_t curr_ticks)
++{
++    uint64_t limit = curr_ticks + HPET_32BIT_MAX_ARM;
++    if (timeout > limit) {
++        timeout = limit;
++    }
++    /* write the low 32 bits only (32-bit comparator, or 64-bit one forced to 32-bit mode) */
++    *(volatile uint32_t *)((uintptr_t)timer_0 + offsetof(hpet_timer_t, comparator)) = (uint32_t)timeout;
++    return timeout;
++}
++
+ static void process_timeouts(uint64_t curr_ticks)
+ {
+-    uint64_t next_timeout = UINT64_MAX;
+-    for (int i = 0; i < MAX_TIMEOUTS; i++) {
+-        if (timeouts[i] <= curr_ticks) {
+-            sddf_notify(i);
+-            timeouts[i] = UINT64_MAX;
+-        } else if (timeouts[i] < next_timeout) {
+-            next_timeout = timeouts[i];
++    for (;;) {
++        uint64_t next_timeout = UINT64_MAX;
++        for (int i = 0; i < MAX_TIMEOUTS; i++) {
++            if (timeouts[i] <= curr_ticks) {
++                sddf_notify(i);
++                timeouts[i] = UINT64_MAX;
++            } else if (timeouts[i] < next_timeout) {
++                next_timeout = timeouts[i];
++            }
+         }
+-    }
+ 
+-    if (next_timeout != UINT64_MAX) {
+-        set_timeout(next_timeout);
++        if (!hpet_32bit) {
++            if (next_timeout != UINT64_MAX) {
++                set_timeout(next_timeout);
++            }
++            return;
++        }
++
++        /* 32-bit mode: always keep the comparator armed (keep-alive) so that wraps are not missed.
++         * The comparator fires once, on equality. If the armed time has already passed when we
++         * re-read the counter, that interrupt may never come, so process again instead. */
++        uint64_t armed = set_timeout_32bit(next_timeout, curr_ticks);
++        curr_ticks = get_hpet_ticks();
++        if (curr_ticks < armed) {
++            return;
++        }
+     }
+ }
+ 
+@@ -150,15 +218,42 @@ void init(void)
+     uint64_t tick_period_fs = capability >> 32;
+     hpet_freq = FS_IN_S / tick_period_fs;
+ 
+-    /* Make sure that the main counter is 64-bit wide and legacy IRQ routing capable. */
+-    assert(capability & BIT(COUNT_SIZE_CAP));
+-    assert(capability & BIT(LEG_RT_CAP));
++    /* Use the 32-bit mode if the main counter is not 64-bit wide, and route the IRQ directly to the
++     * I/O APIC if there is no legacy replacement route. */
++    bool counter_64bit = capability & BIT(COUNT_SIZE_CAP);
++    bool legacy_route = (capability & BIT(LEG_RT_CAP)) && HPET_IOAPIC_PIN == 2;
++#ifdef HPET_FORCE_32BIT
++    hpet_32bit = true;
++    legacy_route = false;
++#else
++    hpet_32bit = !counter_64bit;
++#endif
+ 
+     timer_0 = (volatile hpet_timer_t *)(HPET_REGION + HPET_TIMER0_OFFSET);
+     uint64_t t0_cfg = timer_0->config;
++    uint32_t t0_route_cap = (uint32_t)(t0_cfg >> TN_INT_ROUTE_CAP);
++
++    /* Print what the hardware reports before any check, so that a failed check can be diagnosed */
++    sddf_dprintf("TIMER DRIVER|INFO: HPET cap=0x%lx (%s counter, %lu Hz, legacy route %s), timer0 cfg=0x%lx "
++                 "(I/O APIC route cap 0x%x), using %s mode, IRQ via %s to I/O APIC pin %d\n",
++                 capability, counter_64bit ? "64-bit" : "32-bit", hpet_freq,
++                 (capability & BIT(LEG_RT_CAP)) ? "capable" : "not capable", t0_cfg, t0_route_cap,
++                 hpet_32bit ? "32-bit" : "64-bit", legacy_route ? "legacy route" : "direct route", HPET_IOAPIC_PIN);
++
++    /* Make sure the comparator 0 is 64-bit wide (64-bit mode only) */
++    if (!hpet_32bit) {
++        assert(t0_cfg & BIT(TN_SIZE_CAP));
++    }
+ 
+-    /* Make sure the comparator 0 is 64-bit wide */
+-    assert(t0_cfg & BIT(TN_SIZE_CAP));
++    if (!legacy_route) {
++        if (!(t0_route_cap & BIT(HPET_IOAPIC_PIN))) {
++            LOG_TIMER_DRIVER_ERR("timer0 cannot be routed to I/O APIC pin %d (route cap 0x%x)\n", HPET_IOAPIC_PIN,
++                                 t0_route_cap);
++        }
++        assert(t0_route_cap & BIT(HPET_IOAPIC_PIN));
++        t0_cfg &= ~(0x1fULL << TN_INT_ROUTE_CNF);
++        t0_cfg |= (uint64_t)HPET_IOAPIC_PIN << TN_INT_ROUTE_CNF;
++    }
+ 
+     /* Don't deliver IRQ via the Front Side Bus */
+     t0_cfg &= ~BIT(TN_FSB_EN_CNF);
+@@ -166,26 +261,54 @@ void init(void)
+     t0_cfg &= ~BIT(TN_INT_TYPE_CNF);
+     /* Turn on IRQ */
+     t0_cfg |= BIT(TN_INT_ENB_CNF);
+-    /* 64-bit wide comparator */
+-    t0_cfg &= ~BIT(TN_32MODE_CNF);
++    if (hpet_32bit && (t0_cfg & BIT(TN_SIZE_CAP))) {
++        /* 32-bit mode on a 64-bit comparator: force it to 32 bits */
++        t0_cfg |= BIT(TN_32MODE_CNF);
++    } else {
++        /* 64-bit wide comparator (a 32-bit comparator ignores this bit) */
++        t0_cfg &= ~BIT(TN_32MODE_CNF);
++    }
+     /* Non periodic comparator */
+     t0_cfg &= ~BIT(TN_TYPE_CNF);
+ 
+     timer_0->config = t0_cfg;
+ 
++    if (!legacy_route) {
++        uint64_t t0_cfg_now = timer_0->config;
++        if (((t0_cfg_now >> TN_INT_ROUTE_CNF) & 0x1f) != HPET_IOAPIC_PIN) {
++            LOG_TIMER_DRIVER_ERR("timer0 route did not stick (cfg=0x%lx)\n", t0_cfg_now);
++        }
++    }
++
+     /* Reset the main counter */
+-    *(volatile uint64_t *)(HPET_REGION + HPET_MAIN_COUNTER_REG) = 0;
++    uint64_t counter_start = 0;
++#ifdef HPET_FORCE_32BIT
++    counter_start = (uint32_t)(0 - HPET_FORCE_32BIT_WRAP_SECONDS * hpet_freq);
++#endif
++    if (counter_64bit) {
++        *(volatile uint64_t *)(HPET_REGION + HPET_MAIN_COUNTER_REG) = counter_start;
++    } else {
++        *(volatile uint32_t *)(HPET_REGION + HPET_MAIN_COUNTER_REG) = (uint32_t)counter_start;
++    }
+ 
+     /* Enable main counter */
+     *general_config_reg |= BIT(ENABLE_CNF);
+-    /* Use legacy routing, so that comparator 0's IRQ always come in on I/O APIC pin 2 */
+-    *general_config_reg |= BIT(LEG_RT_CNF);
++    /* Use legacy routing, so that comparator 0's IRQ always come in on I/O APIC pin 2
++     * (otherwise timer 0 was routed directly to HPET_IOAPIC_PIN above) */
++    if (legacy_route) {
++        *general_config_reg |= BIT(LEG_RT_CNF);
++    }
+ 
+     next_timeout = UINT64_MAX;
+     for (int i = 0; i < MAX_TIMEOUTS; i++) {
+         timeouts[i] = UINT64_MAX;
+     }
+ 
++    if (hpet_32bit) {
++        /* Start the keep-alive (no timeouts are pending yet) */
++        process_timeouts(get_hpet_ticks());
++    }
++
+     microkit_deferred_irq_ack(IRQ_CH);
+ 
+     /* Detect TSC */
+@@ -200,6 +323,7 @@ void init(void)
+          */
+     } else {
+         LOG_TIMER_DRIVER("using TSC as clocksource, HPET as clockevent\n");
++        sddf_dprintf("TIMER DRIVER|INFO: TSC frequency %lu Hz, used for GET_TIME\n", tsc_freq);
+         /* Great! Can fastpath time read PPCs. But we still use the HPET for interrupts,
+          * as seL4 uses already used the TSC interrupt mechanism (Local APIC timer) for scheduling. */
+     }
+diff --git a/tools/meta/board.py b/tools/meta/board.py
+index fb99f6e..94bb908 100644
+--- a/tools/meta/board.py
++++ b/tools/meta/board.py
+@@ -12,14 +12,15 @@ ProtectionDomain = SystemDescription.ProtectionDomain
+ assert version("sdfgen").split(".")[1] == "35", "Unexpected sdfgen version"
+ 
+ 
+-def add_x86_hpet(sdf: SystemDescription, timer_driver: ProtectionDomain):
++def add_x86_hpet(sdf: SystemDescription, timer_driver: ProtectionDomain, ioapic_pin: int = 2):
+     # Timer IRQ must be the highest priority (highest vector) to ensure they are delivered
+     # as close as possible to the timer expiry. The highest vector is defined by (irq_user_max - irq_user_min) in seL4 source
+-    # Since our HPET driver uses legacy IRQ routing, comparator 0's IRQ will always arrives at
+-    # I/O APIC 0's pin 2.
++    # With the default ioapic_pin=2 our HPET driver uses legacy IRQ routing, so comparator 0's IRQ
++    # arrives at I/O APIC 0's pin 2. Another pin must match the driver's HPET_IOAPIC_PIN, which then
++    # routes comparator 0 directly to that pin (mtabe19/qedos fork).
+     hpet_irq = SystemDescription.IrqIoapic(
+         ioapic_id=0,
+-        pin=2,
++        pin=ioapic_pin,
+         vector=107,
+         id=0,
+         trigger=SystemDescription.IrqIoapic.Trigger.EDGE,

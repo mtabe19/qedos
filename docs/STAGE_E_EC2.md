@@ -104,6 +104,9 @@ QEDOS_SEL4_DIR=build/sel4-x86_64_generic QEDOS_DISK_IMG=build/disk/qedos-bios-re
 
 - 出力は `build/sel4-x86_64_generic/` (上流のビルド済み `build/sel4/` は比較用に残す)。`sel4_32.elf` は SDK のカーネルをコピーする
 - 新しい scp はリモート側の `{a,b}` を展開しないので、複数ファイルは rsync で取る
+- sDDF への変更は `patches/sddf/*.patch` に置き、`build-sddf.sh` が checkout のたびに当て直す。`build-sel4.sh` は毎回 `build-sddf.sh` を呼ぶ (make が差分だけビルドする)
+- `QEDOS_HPET_IOAPIC_PIN` (既定 23): HPET タイマーの IRQ の IOAPIC pin。ドライバ (`-DHPET_IOAPIC_PIN`) と `meta_proofgate.py --hpet-ioapic-pin` の両方に同じ値が渡る。EC2 のタイマー 0 は pin 16-23 にしか出せない (4.1)。QEMU (q35) でも 23 で動く
+- `QEDOS_HPET_FORCE_32BIT=1`: 試験用。64 ビットの HPET でも 32 ビットモード + IOAPIC 直接経路で動かし (EC2 と同じ条件)、カウンタを一周の 5 秒前から始める。出力は `build/echo-x86_64_generic-hpet32/`, `build/sel4-x86_64_generic-hpet32/`
 
 EC2 で起動試験 (Mac で):
 
@@ -122,6 +125,11 @@ QEDOS_DISK_IMG=build/disk/qedos-bios-rebuilt.img tools/ec2/boot-test.sh
 | M2-1 | Ubuntu 24.04 VM (clang/lld 18.1.3, Rust 1.99.1) で x86_64 を再ビルド (2.5) | sDDF echo_server、seL4 用 OpenSSL、`build-sel4.sh` とも成功 (pancake の `cake` は不要) |
 | M2-2 | 再ビルドしたイメージで `tests/test_sel4.py` (VM, QEMU 8.2.2 TCG)。`-kernel/-initrd` と GRUB ディスクの両方 | SEL4_001..006 PASS (両方) |
 | M2-3 | 再ビルドしたディスクイメージで EC2 t3.medium | M1-2 と同じ (4.1 の 2 か所で停止、tls/http/policy/connector は初期化成功) |
+| M3-1 | sDDF `tsc_hpet` を 32 ビット HPET に対応 (`patches/sddf/0001-tsc_hpet-32bit-counter.patch`) | カウンタをソフトウェアで 64 ビットに拡張、一周の半分ごとに必ず割り込みを予約。HPET の値を起動時に表示 |
+| M3-2 | QEMU (VM) で通常ビルドと `QEDOS_HPET_FORCE_32BIT=1` | 両方 SEL4_001..006 PASS。強制モードは一周 (`wrapped (1)`) をまたいで PASS |
+| M3-3 | EC2 t3.medium (1 回目) | `LEG_RT_CAP` の assert で停止 (レガシー経路なし) |
+| M3-4 | EC2 t3.medium (2 回目、IOAPIC pin 2 へ直接経路) | `timer0 cannot be routed to I/O APIC pin 2 (route cap 0xff0000)` で停止 |
+| M3-5 | EC2 t3.medium (3 回目、IOAPIC pin 23 へ直接経路) | **timer_driver 初期化成功**。tcp_pd が `listening on 0.0.0.0:8443` まで進み、`wrapped (1)..(3)` を観測 (約 68.7 秒ごと)。ethernet_driver は従来どおり停止 |
 
 M2 の上流ビルド済みイメージとの比較:
 
@@ -155,9 +163,18 @@ M1-2 の実行メモ:
 | ACPI | RSDT/FADT/MADT あり。IOAPIC `0xfec00000`、LAPIC `0xfee00000` | |
 | CPU | APIC 2 個を検出、1 個のみ使用 (`only support 1`) | seL4 の設定がシングルコア |
 | IOMMU | `ACPI: 0 IOMMUs detected` | NIC の DMA から tls_pd の鍵を守れない (上流計画の Security issue と同じ) |
-| timer_driver | `sddf/drivers/timer/tsc_hpet/timer.c:154` `capability & BIT(COUNT_SIZE_CAP)` で assert | HPET が無い、または別アドレスと推測。要調査 |
+| timer_driver | (M3 前) `timer.c:154` `capability & BIT(COUNT_SIZE_CAP)` で assert。M3 のパッチ後は初期化成功 (下記) | 32 ビット HPET のため。解決済み (3 章 M3) |
 | ethernet_driver | `sddf/virtio/transport/pci.c:183` `read_pci_general_device_header` で assert | PCI 0:2.0 に virtio が無い (想定どおり。EC2 は ENA) |
-| tls/http/policy/connector | 初期化成功 (Ed25519 署名検証 OK) | tcp_pd はタイマーと NIC 待ちで出力なし |
+| tls/http/policy/connector | 初期化成功 (Ed25519 署名検証 OK) | M3 前の tcp_pd はタイマーと NIC 待ちで出力なし。M3 後は `TCP_PD: listening on 0.0.0.0:8443` |
+
+HPET (M3 のパッチが起動時に表示した値):
+
+| 項目 | 値 |
+|---|---|
+| 能力レジスタ | `0x00f4240080860701`: 周期 16ns (62.5MHz)、タイマー 8 個、`COUNT_SIZE_CAP`=0 (32 ビット)、`LEG_RT_CAP`=0 (レガシー経路なし) |
+| タイマー 0 設定レジスタ | `0x00ff000000008010`: コンパレータ 32 ビット、周期モード可、FSB (MSI) 配送可、IOAPIC への経路は pin 16-23 のみ (`TN_INT_ROUTE_CAP`=0xff0000) |
+| TSC | CPUID 0x15/0x16 から周波数が取れない (`Cannot detect or use TSC frequency`)。時刻の読み出しも HPET を使う (遅い) |
+| 割り込み | IOAPIC pin 23 (エッジ) で届く。NIC が無い状態で tcp_pd の lwIP の周期タイムアウトが回り続け、一周の検出が続いたことから判断 |
 
 ### 4.2 Amazon Linux 2023 での調査から (`collect-facts.sh`, 2026-10-20)
 
@@ -179,11 +196,14 @@ M1-2 の実行メモ:
 1. ~~EC2 の構成を調べる~~ (済、4.2)
 2. ~~**x86_64 の再ビルド**~~ (済、2.5 と 3 章 M2): `build-sddf.sh` を x86_64_generic に対応させ、
    `build-sel4.sh` は x86_64 でも sDDF を自分でビルドして `build/sel4-x86_64_generic/` に出力するようにした
-3. **タイマー**: (a) sDDF `tsc_hpet` を 32 ビット HPET (62.5MHz、約 68.7 秒で一周) に対応させる、または
-   (b) TSC (不変・周波数既知) + TSC deadline タイマーを使う。上流 sDDF の新しい版で対応済みかも確認する
+3. ~~**タイマー**~~ (済、3 章 M3): sDDF `tsc_hpet` を 32 ビット HPET と IOAPIC 直接経路に対応させた。
+   TSC deadline タイマーは seL4 カーネルがスケジューリングに LAPIC タイマーとして使うため、ユーザーレベルのドライバでは使えない
+   (`timer.c` のコメント)。上流 sDDF (2026-10-20 時点の main) に 32 ビット HPET の対応は無い
 4. **アドレスのプロファイル化**: `sel4/meta_proofgate.py` の QEMU 前提の値 (virtio BAR `0xFE000000`, DMA `0x7A000000`,
    IOAPIC pin 11, COM1 `0x3F8`, PCI 0:2.0) をマシン別プロファイルへ。EC2 t3 の値は 4.2 から作る
 5. **ENA ドライバ (sDDF)**: 最大の作業。BAR0 のみ・MSI-X 必須。seL4/Microkit (sdfgen `IrqMsi`) で MSI を受け、
    MSI-X テーブルを誰が設定するかを先に確認する。参考実装のライセンスは取り込み前に確認する
 6. **IOMMU**: EC2 では使えない前提で、NIC を信頼境界に含めることを評価記録に明記する
 7. **UEFI 版ディスクイメージ**: UEFI のみのインスタンスタイプ向け。上流計画にある GRUB + UEFI の問題を QEMU (OVMF) で先に確認する
+8. **TSC の周波数**: EC2 では CPUID 0x15/0x16 から取れず、時刻の読み出しが HPET になる (性能の問題)。
+   CPUID 0x40000010 (ハイパーバイザが周波数を知らせる leaf) を使うか、HPET と比べて測るかを検討する (未調査)

@@ -38,6 +38,7 @@ GitHub の「Sync fork」ボタンでも main は更新できる。
   Rust 以外 (`sel4/` の C、スクリプト) も同じかは未確認
 - Apache-2.0 で守ること: 変更したファイルには変更した旨を残す、元の著作権表示を消さない
 - `third_party/` (OpenSSL、seL4、sDDF、Microkit など) はそれぞれのライセンスに従う
+- `patches/sddf/` は sDDF (BSD-2-Clause) への変更。ビルド時に `third_party/sddf` に当てる
 - 参考にする外部コード (ENA ドライバの FreeBSD 版など) は、取り込む前にライセンスを確認する
 - イメージの配布など公開範囲を広げるときは、作者にライセンスの範囲を確認する
 
